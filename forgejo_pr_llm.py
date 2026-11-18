@@ -37,7 +37,7 @@ import requests
 
 __version__ = "1.1.0"
 
-DEFAULT_LLM_TIMEOUT = 900          # 15 минут
+DEFAULT_LLM_TIMEOUT = 900  # 15 минут
 DEFAULT_PAGE_SIZE = 50
 DEFAULT_MAX_FILE_BYTES = 512 * 1024
 DEFAULT_MAX_PROMPT_BYTES = 1024 * 1024
@@ -46,13 +46,25 @@ MAX_UNIFIED_DIFF_BYTES = 8 * 1024 * 1024
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 # Сегменты веб-путей, по которым обрезаем «хвост» URL (…/owner/repo/src/branch/main)
-_TRAILING_MARKERS = {"src", "issues", "pulls", "wiki", "settings", "commits",
-                     "releases", "activity", "branches", "tags", "projects"}
+_TRAILING_MARKERS = {
+    "src",
+    "issues",
+    "pulls",
+    "wiki",
+    "settings",
+    "commits",
+    "releases",
+    "activity",
+    "branches",
+    "tags",
+    "projects",
+}
 
 
 # --------------------------------------------------------------------------- #
 #  Вспомогательное
 # --------------------------------------------------------------------------- #
+
 
 class ConfigError(Exception):
     """Ошибка конфигурации/аргументов — код возврата 2."""
@@ -101,9 +113,7 @@ def parse_repo_url(raw: str) -> tuple[str, str, str]:
 
     parsed = urlparse(value)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ConfigError(
-            f"URL репозитория должен начинаться с http:// или https:// — получено: {raw!r}"
-        )
+        raise ConfigError(f"URL репозитория должен начинаться с http:// или https:// — получено: {raw!r}")
 
     path = parsed.path.strip("/")
     if path.endswith(".git"):
@@ -117,9 +127,7 @@ def parse_repo_url(raw: str) -> tuple[str, str, str]:
             break
 
     if len(segments) < 2:
-        raise ConfigError(
-            f"В URL не найдены owner/repo. Ожидается https://host/owner/repo — получено: {raw!r}"
-        )
+        raise ConfigError(f"В URL не найдены owner/repo. Ожидается https://host/owner/repo — получено: {raw!r}")
 
     owner, repo = segments[-2], segments[-1]
     prefix = "/".join(segments[:-2])
@@ -174,9 +182,7 @@ def parse_label_filters(expressions: Iterable[str] | str | None) -> tuple[list[s
 
     for value in raw_values:
         if not value.strip():
-            raise ConfigError(
-                "Пустое значение --label: укажите метки, например --label=bug,-wip."
-            )
+            raise ConfigError("Пустое значение --label: укажите метки, например --label=bug,-wip.")
         for raw in value.split(","):
             token = raw.strip()
             if not token:
@@ -192,16 +198,12 @@ def parse_label_filters(expressions: Iterable[str] | str | None) -> tuple[list[s
             token = token.strip()
             if not token:
                 raise ConfigError(
-                    f"Пустое имя метки в --label: {value!r}. "
-                    f"Метку, начинающуюся с дефиса, экранируйте так: '\\-имя'."
+                    f"Пустое имя метки в --label: {value!r}. Метку, начинающуюся с дефиса, экранируйте так: '\\-имя'."
                 )
             target.append(token)
 
     if raw_values and not (required or forbidden):
-        raise ConfigError(
-            "В --label не найдено ни одной метки. "
-            "Пример корректного значения: --label=bug,-wip."
-        )
+        raise ConfigError("В --label не найдено ни одной метки. Пример корректного значения: --label=bug,-wip.")
 
     # Дубликаты схлопываем, сохраняя порядок ввода
     required = list(dict.fromkeys(required))
@@ -273,6 +275,7 @@ def _shorten(text: str | None, limit: int = 400) -> str:
 #  Клиент Forgejo API
 # --------------------------------------------------------------------------- #
 
+
 class ForgejoClient:
     """Тонкая обёртка над REST API Forgejo (унаследован от Gitea)."""
 
@@ -294,11 +297,13 @@ class ForgejoClient:
         self.timeout = timeout
         self.verbose = verbose
         self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"token {token}",
-            "Accept": "application/json",
-            "User-Agent": f"forgejo-pr-llm/{__version__}",
-        })
+        self.session.headers.update(
+            {
+                "Authorization": f"token {token}",
+                "Accept": "application/json",
+                "User-Agent": f"forgejo-pr-llm/{__version__}",
+            }
+        )
 
     # -- низкий уровень ----------------------------------------------------- #
 
@@ -316,9 +321,7 @@ class ForgejoClient:
 
         for attempt in range(self.retries):
             try:
-                resp = self.session.request(
-                    method, url, params=params, timeout=(15, self.timeout)
-                )
+                resp = self.session.request(method, url, params=params, timeout=(15, self.timeout))
             except requests.RequestException as exc:
                 last_error = f"сетевая ошибка: {exc}"
                 if attempt + 1 < self.retries:
@@ -332,8 +335,7 @@ class ForgejoClient:
                     self._backoff(attempt, f"HTTP {resp.status_code}; повтор", resp)
                     continue
                 raise ForgejoError(
-                    f"Сервер вернул {resp.status_code} после {self.retries} попыток: "
-                    f"{_shorten(resp.text)}",
+                    f"Сервер вернул {resp.status_code} после {self.retries} попыток: {_shorten(resp.text)}",
                     status=resp.status_code,
                     url=url,
                 )
@@ -342,9 +344,7 @@ class ForgejoClient:
                 return None
 
             if resp.status_code >= 400:
-                raise ForgejoError(
-                    self._explain(resp), status=resp.status_code, url=url
-                )
+                raise ForgejoError(self._explain(resp), status=resp.status_code, url=url)
 
             if raw:
                 return resp.text
@@ -353,9 +353,7 @@ class ForgejoClient:
             try:
                 return resp.json()
             except ValueError as exc:
-                raise ForgejoError(
-                    f"Ответ не является JSON: {_shorten(resp.text)}", url=url
-                ) from exc
+                raise ForgejoError(f"Ответ не является JSON: {_shorten(resp.text)}", url=url) from exc
 
         raise ForgejoError(last_error, url=url)
 
@@ -363,12 +361,16 @@ class ForgejoClient:
     def _explain(resp: requests.Response) -> str:
         body = _shorten(resp.text)
         if resp.status_code == 401:
-            return (f"401 Unauthorized — токен не принят. Проверьте значение --token "
-                    f"и срок его действия. Ответ сервера: {body}")
+            return (
+                f"401 Unauthorized — токен не принят. Проверьте значение --token "
+                f"и срок его действия. Ответ сервера: {body}"
+            )
         if resp.status_code == 403:
-            return (f"403 Forbidden — токен принят, но прав недостаточно. "
-                    f"Нужны scope 'read:repository' (и 'read:issue' для комментариев). "
-                    f"Ответ сервера: {body}")
+            return (
+                f"403 Forbidden — токен принят, но прав недостаточно. "
+                f"Нужны scope 'read:repository' (и 'read:issue' для комментариев). "
+                f"Ответ сервера: {body}"
+            )
         return f"HTTP {resp.status_code} {resp.reason}: {body}"
 
     def _backoff(self, attempt: int, why: str, resp: requests.Response | None = None) -> None:
@@ -410,9 +412,7 @@ class ForgejoClient:
         return self._request("GET", f"/repos/{owner}/{repo}")
 
     def list_open_pulls(self, owner: str, repo: str) -> Iterator[dict[str, Any]]:
-        return self._paginate(
-            f"/repos/{owner}/{repo}/pulls", params={"state": "open"}
-        )
+        return self._paginate(f"/repos/{owner}/{repo}/pulls", params={"state": "open"})
 
     def get_pull(self, owner: str, repo: str, index: int) -> dict[str, Any]:
         return self._request("GET", f"/repos/{owner}/{repo}/pulls/{index}")
@@ -425,8 +425,10 @@ class ForgejoClient:
 
     def get_pull_diff(self, owner: str, repo: str, index: int) -> str | None:
         return self._request(
-            "GET", f"/repos/{owner}/{repo}/pulls/{index}.diff",
-            allow_404=True, raw=True,
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{index}.diff",
+            allow_404=True,
+            raw=True,
         )
 
     def list_issue_comments(self, owner: str, repo: str, index: int) -> list[dict[str, Any]]:
@@ -435,12 +437,8 @@ class ForgejoClient:
     def list_pull_reviews(self, owner: str, repo: str, index: int) -> list[dict[str, Any]]:
         return list(self._paginate(f"/repos/{owner}/{repo}/pulls/{index}/reviews"))
 
-    def list_review_comments(
-        self, owner: str, repo: str, index: int, review_id: int
-    ) -> list[dict[str, Any]]:
-        return list(self._paginate(
-            f"/repos/{owner}/{repo}/pulls/{index}/reviews/{review_id}/comments"
-        ))
+    def list_review_comments(self, owner: str, repo: str, index: int, review_id: int) -> list[dict[str, Any]]:
+        return list(self._paginate(f"/repos/{owner}/{repo}/pulls/{index}/reviews/{review_id}/comments"))
 
     def list_timeline(self, owner: str, repo: str, index: int) -> list[dict[str, Any]] | None:
         """Timeline есть не во всех версиях Forgejo — None означает «эндпоинт недоступен»."""
@@ -449,7 +447,8 @@ class ForgejoClient:
         page = 1
         while page <= self.max_pages:
             chunk = self._request(
-                "GET", path,
+                "GET",
+                path,
                 params={"page": page, "limit": self.page_size},
                 allow_404=True,
             )
@@ -468,9 +467,7 @@ class ForgejoClient:
 
     # -- файлы -------------------------------------------------------------- #
 
-    def get_file_content(
-        self, repo_full_name: str, path: str, ref: str
-    ) -> dict[str, Any] | None:
+    def get_file_content(self, repo_full_name: str, path: str, ref: str) -> dict[str, Any] | None:
         """Содержимое файла на конкретном коммите. None — файл не найден (404)."""
         quoted = quote(path, safe="/")
         data = self._request(
@@ -501,12 +498,55 @@ class ForgejoClient:
 # --------------------------------------------------------------------------- #
 
 BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff", ".psd",
-    ".pdf", ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tar", ".jar", ".war",
-    ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".class", ".pyc", ".wasm",
-    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".avi", ".mov",
-    ".mkv", ".webm", ".wav", ".flac", ".doc", ".docx", ".xls", ".xlsx",
-    ".ppt", ".pptx", ".sqlite", ".db",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".ico",
+    ".webp",
+    ".tiff",
+    ".psd",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".rar",
+    ".tar",
+    ".jar",
+    ".war",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".o",
+    ".a",
+    ".class",
+    ".pyc",
+    ".wasm",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".eot",
+    ".mp3",
+    ".mp4",
+    ".avi",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".wav",
+    ".flac",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".sqlite",
+    ".db",
 }
 
 
@@ -556,11 +596,13 @@ class PRCollector:
             try:
                 return fn()
             except ForgejoError as exc:
-                errors.append({
-                    "endpoint": label,
-                    "status": exc.status,
-                    "message": str(exc),
-                })
+                errors.append(
+                    {
+                        "endpoint": label,
+                        "status": exc.status,
+                        "message": str(exc),
+                    }
+                )
                 warnings.append(f"PR #{index}: не удалось получить {label} ({exc.status})")
                 return default
 
@@ -568,14 +610,13 @@ class PRCollector:
         files = guard("files", lambda: self.client.list_pull_files(owner, repo, index), [])
         issue_comments = guard(
             "issue_comments",
-            lambda: self.client.list_issue_comments(owner, repo, index), [],
+            lambda: self.client.list_issue_comments(owner, repo, index),
+            [],
         )
         reviews = guard("reviews", lambda: self.client.list_pull_reviews(owner, repo, index), [])
         timeline = guard("timeline", lambda: self.client.list_timeline(owner, repo, index), None)
 
-        review_comments = self._collect_review_comments(
-            owner, repo, index, reviews, errors, warnings
-        )
+        review_comments = self._collect_review_comments(owner, repo, index, reviews, errors, warnings)
 
         head_sha = (pull.get("head") or {}).get("sha") or ""
         head_repo = (pull.get("head") or {}).get("repo") or {}
@@ -587,24 +628,18 @@ class PRCollector:
         if diff_text:
             diff_parts = split_unified_diff(diff_text)
             if len(diff_text.encode("utf-8", "replace")) > self.max_diff_bytes:
-                warnings.append(
-                    f"PR #{index}: дифф больше {human_bytes(self.max_diff_bytes)}, "
-                    f"сохранён частично"
-                )
+                warnings.append(f"PR #{index}: дифф больше {human_bytes(self.max_diff_bytes)}, сохранён частично")
                 diff_text = diff_text[: self.max_diff_bytes]
                 warnings.append(f"PR #{index}: unified_diff обрезан до {human_bytes(len(diff_text))}")
 
         enriched_files = [
-            self._enrich_file(owner, repo, index, head_full_name, head_sha, f, diff_parts, warnings)
-            for f in files
+            self._enrich_file(owner, repo, index, head_full_name, head_sha, f, diff_parts, warnings) for f in files
         ]
 
         history_unavailable = timeline is None
         if history_unavailable:
             timeline = self._synthetic_timeline(issue_comments, reviews, review_comments)
-            warnings.append(
-                f"PR #{index}: эндпоинт timeline недоступен, собрана синтетическая история"
-            )
+            warnings.append(f"PR #{index}: эндпоинт timeline недоступен, собрана синтетическая история")
 
         return {
             "schema_version": "1.0",
@@ -659,11 +694,13 @@ class PRCollector:
             try:
                 comments = self.client.list_review_comments(owner, repo, index, rid)
             except ForgejoError as exc:
-                errors.append({
-                    "endpoint": f"reviews/{rid}/comments",
-                    "status": exc.status,
-                    "message": str(exc),
-                })
+                errors.append(
+                    {
+                        "endpoint": f"reviews/{rid}/comments",
+                        "status": exc.status,
+                        "message": str(exc),
+                    }
+                )
                 warnings.append(f"PR #{index}: не удалось получить комментарии ревью {rid}")
                 continue
             for c in comments:
@@ -693,9 +730,7 @@ class PRCollector:
         elif item.get("patch"):
             item["patch_source"] = "api"
 
-        item["content"] = self._fetch_content(
-            owner, repo, index, head_full_name, head_sha, path, status, warnings
-        )
+        item["content"] = self._fetch_content(owner, repo, index, head_full_name, head_sha, path, status, warnings)
         return item
 
     def _fetch_content(
@@ -710,8 +745,12 @@ class PRCollector:
         warnings: list[str],
     ) -> dict[str, Any]:
         base = {
-            "encoding": None, "text": None, "size": None,
-            "binary": False, "truncated": False, "skipped_reason": None,
+            "encoding": None,
+            "text": None,
+            "size": None,
+            "binary": False,
+            "truncated": False,
+            "skipped_reason": None,
         }
         if status == "removed":
             return {**base, "skipped_reason": "deleted_in_pr"}
@@ -735,8 +774,7 @@ class PRCollector:
                     f"PR #{index}: файл {path} ({human_bytes(size)}) больше лимита "
                     f"{human_bytes(self.max_file_bytes)} — содержимое не сохранено"
                 )
-                return {**base, "size": size, "skipped_reason": "too_large",
-                        "encoding": meta.get("encoding")}
+                return {**base, "size": size, "skipped_reason": "too_large", "encoding": meta.get("encoding")}
 
             payload = meta.get("content")
             if payload is None:
@@ -786,36 +824,42 @@ class PRCollector:
     ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         for c in issue_comments:
-            events.append({
-                "type": "comment",
-                "id": c.get("id"),
-                "user": c.get("user"),
-                "created_at": c.get("created_at"),
-                "body": c.get("body"),
-                "_synthetic": True,
-            })
+            events.append(
+                {
+                    "type": "comment",
+                    "id": c.get("id"),
+                    "user": c.get("user"),
+                    "created_at": c.get("created_at"),
+                    "body": c.get("body"),
+                    "_synthetic": True,
+                }
+            )
         for r in reviews:
-            events.append({
-                "type": "review",
-                "id": r.get("id"),
-                "user": r.get("user"),
-                "created_at": r.get("submitted_at") or r.get("created_at"),
-                "body": r.get("body"),
-                "state": r.get("state"),
-                "commit_id": r.get("commit_id"),
-                "_synthetic": True,
-            })
+            events.append(
+                {
+                    "type": "review",
+                    "id": r.get("id"),
+                    "user": r.get("user"),
+                    "created_at": r.get("submitted_at") or r.get("created_at"),
+                    "body": r.get("body"),
+                    "state": r.get("state"),
+                    "commit_id": r.get("commit_id"),
+                    "_synthetic": True,
+                }
+            )
         for rc in review_comments:
-            events.append({
-                "type": "review_comment",
-                "id": rc.get("id"),
-                "user": rc.get("user"),
-                "created_at": rc.get("created_at"),
-                "body": rc.get("body"),
-                "path": rc.get("path"),
-                "line": rc.get("line"),
-                "_synthetic": True,
-            })
+            events.append(
+                {
+                    "type": "review_comment",
+                    "id": rc.get("id"),
+                    "user": rc.get("user"),
+                    "created_at": rc.get("created_at"),
+                    "body": rc.get("body"),
+                    "path": rc.get("path"),
+                    "line": rc.get("line"),
+                    "_synthetic": True,
+                }
+            )
         events.sort(key=lambda e: e.get("created_at") or "")
         return events
 
@@ -823,6 +867,7 @@ class PRCollector:
 # --------------------------------------------------------------------------- #
 #  Клиент LLM (OpenAI-совместимый chat/completions)
 # --------------------------------------------------------------------------- #
+
 
 class LLMClient:
     """Запрос к локальной модели с ожиданием завершения и выводом хода работы."""
@@ -923,9 +968,7 @@ class LLMClient:
         usage: dict[str, Any] | None = None
 
         try:
-            resp = self.session.post(
-                self.endpoint, json=body, timeout=(10, self.timeout), stream=True
-            )
+            resp = self.session.post(self.endpoint, json=body, timeout=(10, self.timeout), stream=True)
         except requests.Timeout as exc:
             where = f" ({label})" if label else ""
             raise LLMError(f"таймаут подключения к LLM{where}: {exc}", retryable=True) from exc
@@ -937,15 +980,16 @@ class LLMClient:
                 detail = _shorten(resp.text, 300)
                 raise LLMError(
                     f"LLM отклонила стриминг (HTTP {resp.status_code}): {detail}",
-                    retryable=False, status=resp.status_code,
+                    retryable=False,
+                    status=resp.status_code,
                 )
             if resp.status_code in RETRY_STATUS:
-                raise LLMError(f"LLM вернула HTTP {resp.status_code}", retryable=True,
-                               status=resp.status_code)
+                raise LLMError(f"LLM вернула HTTP {resp.status_code}", retryable=True, status=resp.status_code)
             if resp.status_code >= 400:
                 raise LLMError(
                     f"LLM вернула HTTP {resp.status_code}: {_shorten(resp.text, 300)}",
-                    retryable=False, status=resp.status_code,
+                    retryable=False,
+                    status=resp.status_code,
                 )
 
             if "text/event-stream" not in resp.headers.get("Content-Type", ""):
@@ -1042,12 +1086,12 @@ class LLMClient:
                 log("\r" + " " * 60 + "\r")
 
         if resp.status_code in RETRY_STATUS:
-            raise LLMError(f"LLM вернула HTTP {resp.status_code}", retryable=True,
-                           status=resp.status_code)
+            raise LLMError(f"LLM вернула HTTP {resp.status_code}", retryable=True, status=resp.status_code)
         if resp.status_code >= 400:
             raise LLMError(
                 f"LLM вернула HTTP {resp.status_code}: {_shorten(resp.text, 300)}",
-                retryable=False, status=resp.status_code,
+                retryable=False,
+                status=resp.status_code,
             )
         try:
             data = resp.json()
@@ -1074,9 +1118,7 @@ class LLMClient:
         message = choice.get("message") or {}
         content = message.get("content")
         if isinstance(content, list):  # некоторые серверы отдают список блоков
-            content = "".join(
-                part.get("text", "") for part in content if isinstance(part, dict)
-            )
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
         return str(content or ""), usage
 
     def _print_answer(self, text: str) -> None:
@@ -1103,6 +1145,7 @@ class LLMClient:
 # --------------------------------------------------------------------------- #
 #  Оркестрация
 # --------------------------------------------------------------------------- #
+
 
 class Orchestrator:
     def __init__(self, args: argparse.Namespace, base_url: str, owner: str, repo: str) -> None:
@@ -1145,9 +1188,7 @@ class Orchestrator:
         required, forbidden = self._label_filters()
         if required or forbidden:
             labels = {
-                (lbl.get("name") or "").strip().lower()
-                for lbl in (pull.get("labels") or [])
-                if isinstance(lbl, dict)
+                (lbl.get("name") or "").strip().lower() for lbl in (pull.get("labels") or []) if isinstance(lbl, dict)
             }
             # все обязательные метки должны присутствовать (И)
             for name in required:
@@ -1160,12 +1201,8 @@ class Orchestrator:
 
         if self.args.assignee:
             wanted = self.args.assignee.lower()
-            logins = {
-                (a.get("login") or "").lower()
-                for a in (pull.get("assignees") or [])
-                if isinstance(a, dict)
-            }
-            single = (pull.get("assignee") or {})
+            logins = {(a.get("login") or "").lower() for a in (pull.get("assignees") or []) if isinstance(a, dict)}
+            single = pull.get("assignee") or {}
             if isinstance(single, dict) and single.get("login"):
                 logins.add(single["login"].lower())
             if wanted not in logins:
@@ -1194,8 +1231,7 @@ class Orchestrator:
         if repo_info.get("empty"):
             log("Репозиторий пуст.")
             return 0
-        log(f"Доступ подтверждён: {repo_info.get('full_name')} "
-            f"(default branch: {repo_info.get('default_branch')})")
+        log(f"Доступ подтверждён: {repo_info.get('full_name')} (default branch: {repo_info.get('default_branch')})")
 
         log("Загружаю список открытых PR…")
         try:
@@ -1214,8 +1250,7 @@ class Orchestrator:
                 criteria.append(f"метки «{format_label_filters(required, forbidden)}»")
             if self.args.assignee:
                 criteria.append(f"assignee «{self.args.assignee}»")
-            log(f"После фильтра (И: {', '.join(criteria)}): {len(selected)} "
-                f"(отсеяно {filtered_out})")
+            log(f"После фильтра (И: {', '.join(criteria)}): {len(selected)} (отсеяно {filtered_out})")
 
         if not selected:
             log("Нечего обрабатывать.")
@@ -1265,8 +1300,11 @@ class Orchestrator:
                 log("    · собираю данные PR…")
                 try:
                     pr_payload = collector.collect(
-                        self.owner, self.repo, pull,
-                        base_url=self.base_url, warnings=self.warnings,
+                        self.owner,
+                        self.repo,
+                        pull,
+                        base_url=self.base_url,
+                        warnings=self.warnings,
                     )
                 except ForgejoError as exc:
                     log(f"    ! ошибка сбора данных: {exc}")
@@ -1378,8 +1416,16 @@ class Orchestrator:
 #  CLI
 # --------------------------------------------------------------------------- #
 
-_VALUE_FLAGS = {"--label", "--assignee", "--token", "--llm-url", "--model",
-                "--prompt-file", "--output-dir", "--openai-api-token"}
+_VALUE_FLAGS = {
+    "--label",
+    "--assignee",
+    "--token",
+    "--llm-url",
+    "--model",
+    "--prompt-file",
+    "--output-dir",
+    "--openai-api-token",
+}
 
 
 def normalize_argv(argv: list[str]) -> list[str]:
@@ -1396,8 +1442,7 @@ def normalize_argv(argv: list[str]) -> list[str]:
         if token == "--":
             result.extend(argv[i:])
             break
-        if (token in _VALUE_FLAGS and i + 1 < len(argv)
-                and not argv[i + 1].startswith("--")):
+        if token in _VALUE_FLAGS and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
             result.append(f"{token}={argv[i + 1]}")
             i += 2
             continue
@@ -1440,18 +1485,25 @@ def build_parser() -> argparse.ArgumentParser:
             "Существующие файлы не перекачиваются (--refresh / --force-llm для повтора)."
         ),
     )
-    parser.add_argument("repo_url", metavar="REPO_URL",
-                        help="Полный URL репозитория: https://host/owner/repo")
-    parser.add_argument("--token", default=os.environ.get("FORGEJO_TOKEN"),
-                        help="Токен доступа Forgejo (по умолчанию $FORGEJO_TOKEN)")
-    parser.add_argument("--llm-url", required=True, metavar="LLM_URL",
-                        help="Полный endpoint, напр. http://localhost:11434/v1/chat/completions")
-    parser.add_argument("--model", required=True,
-                        help="Имя модели для LLM endpoint")
-    parser.add_argument("--prompt-file", required=True, metavar="PATH",
-                        help="Файл с текстом промпта (статическая инструкция)")
+    parser.add_argument("repo_url", metavar="REPO_URL", help="Полный URL репозитория: https://host/owner/repo")
     parser.add_argument(
-        "--label", default=None, action="append", metavar="МЕТКИ",
+        "--token", default=os.environ.get("FORGEJO_TOKEN"), help="Токен доступа Forgejo (по умолчанию $FORGEJO_TOKEN)"
+    )
+    parser.add_argument(
+        "--llm-url",
+        required=True,
+        metavar="LLM_URL",
+        help="Полный endpoint, напр. http://localhost:11434/v1/chat/completions",
+    )
+    parser.add_argument("--model", required=True, help="Имя модели для LLM endpoint")
+    parser.add_argument(
+        "--prompt-file", required=True, metavar="PATH", help="Файл с текстом промпта (статическая инструкция)"
+    )
+    parser.add_argument(
+        "--label",
+        default=None,
+        action="append",
+        metavar="МЕТКИ",
         help=(
             "Фильтр по меткам. Несколько меток — через запятую или повторным "
             "флагом. Метка без префикса обязательна (все условия по И), "
@@ -1459,49 +1511,63 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--openai-api-token", default=os.environ.get("OPENAI_API_TOKEN"), metavar="TOKEN",
+        "--openai-api-token",
+        default=os.environ.get("OPENAI_API_TOKEN"),
+        metavar="TOKEN",
         help=(
             "Bearer-токен для LLM endpoint (заголовок Authorization). "
             "По умолчанию $OPENAI_API_TOKEN; если пусто — не отправляется"
         ),
     )
-    parser.add_argument("--assignee", default=None,
-                        help="Выгружать только PR с этим assignee (логин)")
+    parser.add_argument("--assignee", default=None, help="Выгружать только PR с этим assignee (логин)")
 
     group = parser.add_argument_group("вывод")
-    group.add_argument("--output-dir", default=".",
-                       help="Каталог для результатов (по умолчанию текущий)")
-    group.add_argument("--no-stream", action="store_true",
-                       help="Не печатать ответ LLM в консоль по мере генерации")
-    group.add_argument("--refresh", action="store_true",
-                       help="Перекачать JSON даже если файл уже существует")
-    group.add_argument("--force-llm", action="store_true",
-                       help="Повторить запрос к LLM даже если ответ уже есть")
-    group.add_argument("--dry-run", action="store_true",
-                       help="Только показать список PR, ничего не записывать")
+    group.add_argument("--output-dir", default=".", help="Каталог для результатов (по умолчанию текущий)")
+    group.add_argument("--no-stream", action="store_true", help="Не печатать ответ LLM в консоль по мере генерации")
+    group.add_argument("--refresh", action="store_true", help="Перекачать JSON даже если файл уже существует")
+    group.add_argument("--force-llm", action="store_true", help="Повторить запрос к LLM даже если ответ уже есть")
+    group.add_argument("--dry-run", action="store_true", help="Только показать список PR, ничего не записывать")
 
     tuning = parser.add_argument_group("таймауты и лимиты")
-    tuning.add_argument("--llm-timeout", type=float, default=DEFAULT_LLM_TIMEOUT,
-                        metavar="СЕК", help=f"Ожидание ответа LLM (по умолчанию {DEFAULT_LLM_TIMEOUT})")
+    tuning.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=DEFAULT_LLM_TIMEOUT,
+        metavar="СЕК",
+        help=f"Ожидание ответа LLM (по умолчанию {DEFAULT_LLM_TIMEOUT})",
+    )
     tuning.add_argument("--llm-retries", type=int, default=3, help="Повторы запросов к LLM")
-    tuning.add_argument("--http-timeout", type=float, default=60.0,
-                        metavar="СЕК", help="Таймаут запросов к Forgejo (по умолчанию 60)")
+    tuning.add_argument(
+        "--http-timeout", type=float, default=60.0, metavar="СЕК", help="Таймаут запросов к Forgejo (по умолчанию 60)"
+    )
     tuning.add_argument("--http-retries", type=int, default=3, help="Повторы запросов к Forgejo")
-    tuning.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
-                        help=f"Размер страницы API (по умолчанию {DEFAULT_PAGE_SIZE}, максимум 50)")
-    tuning.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES,
-                        metavar="БАЙТ", help="Лимит содержимого одного файла")
-    tuning.add_argument("--max-prompt-bytes", type=int, default=DEFAULT_MAX_PROMPT_BYTES,
-                        metavar="БАЙТ", help="Порог предупреждения о размере запроса к LLM")
+    tuning.add_argument(
+        "--page-size",
+        type=int,
+        default=DEFAULT_PAGE_SIZE,
+        help=f"Размер страницы API (по умолчанию {DEFAULT_PAGE_SIZE}, максимум 50)",
+    )
+    tuning.add_argument(
+        "--max-file-bytes",
+        type=int,
+        default=DEFAULT_MAX_FILE_BYTES,
+        metavar="БАЙТ",
+        help="Лимит содержимого одного файла",
+    )
+    tuning.add_argument(
+        "--max-prompt-bytes",
+        type=int,
+        default=DEFAULT_MAX_PROMPT_BYTES,
+        metavar="БАЙТ",
+        help="Порог предупреждения о размере запроса к LLM",
+    )
     tuning.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
     if not args.token:
-        raise ConfigError(
-            "Не задан токен: укажите --token или переменную окружения FORGEJO_TOKEN."
-        )
+        raise ConfigError("Не задан токен: укажите --token или переменную окружения FORGEJO_TOKEN.")
     if args.page_size < 1 or args.page_size > 50:
         raise ConfigError("--page-size должен быть от 1 до 50 (ограничение API Forgejo).")
     if args.llm_timeout <= 0:
@@ -1529,8 +1595,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return orchestrator.run()
     except KeyboardInterrupt:
-        log("\n\nПрервано пользователем. Уже записанные файлы сохранены; "
-            "повторный запуск продолжит с места остановки.")
+        log("\n\nПрервано пользователем. Уже записанные файлы сохранены; повторный запуск продолжит с места остановки.")
         return 130
 
 

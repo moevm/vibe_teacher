@@ -1,0 +1,10 @@
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W"]
+exclude = [".git", "__pycache__", ".venv"]
+
+[lint.per-file-ignores]
+# Длинные строки с кириллицей и параметризацией в тестах
+"test_*.py" = ["E501"]
