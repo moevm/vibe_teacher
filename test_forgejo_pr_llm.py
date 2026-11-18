@@ -616,3 +616,227 @@ def test_filter_no_criteria_matches_all():
     ])
     orch = app.Orchestrator(args, "https://h", "o", "r")
     assert orch._matches_filters({"labels": [], "assignees": []}) is True
+
+
+# --------------------------------------------------------------------------- #
+#  parse_label_filters / --label со списком и отрицаниями
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, ([], [])),
+        ("bug", (["bug"], [])),
+        ("bug,docs", (["bug", "docs"], [])),
+        (["bug", "-wip"], (["bug"], ["wip"])),
+        (["bug,docs", "-wip"], (["bug", "docs"], ["wip"])),
+        (["bug", "docs", "-wip", "-draft"], (["bug", "docs"], ["wip", "draft"])),
+        (["  bug , , docs  "], (["bug", "docs"], [])),
+        (["bug,bug"], (["bug"], [])),          # дубликаты схлопываются
+        (["-wip,-wip"], ([], ["wip"])),
+        (["+dash"], (["dash"], [])),           # '+' — явное обязательное
+        (["\\-dash"], (["-dash"], [])),        # экранирование ведущего дефиса
+    ],
+)
+def test_parse_label_filters(value, expected):
+    assert app.parse_label_filters(value) == expected
+
+
+@pytest.mark.parametrize("bad", [["bug,-bug"], ["-"], ["-,,,"], ["bug", "-"]])
+def test_parse_label_filters_errors(bad):
+    with pytest.raises(app.ConfigError):
+        app.parse_label_filters(bad)
+
+
+def test_format_label_filters():
+    assert app.format_label_filters(["bug", "docs"], ["wip"]) == "bug, docs, -wip"
+    assert app.format_label_filters([], ["wip"]) == "-wip"
+    assert app.format_label_filters(["bug"], []) == "bug"
+
+
+def _orch(label=None, assignee=None):
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", "x"]
+    if label is not None:
+        for value in label:
+            argv += ["--label", value]
+    if assignee:
+        argv += ["--assignee", assignee]
+    args = app.build_parser().parse_args(app.normalize_argv(argv))
+    return app.Orchestrator(args, "https://h", "o", "r")
+
+
+def _pull_labels(labels, assignees=()):
+    return {"labels": [{"name": n} for n in labels],
+            "assignees": [{"login": a} for a in assignees]}
+
+
+@pytest.mark.parametrize(
+    "filter_args,labels,expected",
+    [
+        (["bug"], ["bug"], True),
+        (["bug"], ["other"], False),
+        (["bug"], ["bug", "docs"], True),                 # лишние метки не мешают
+        (["bug,docs"], ["bug"], False),                   # нужны обе (И)
+        (["bug,docs"], ["bug", "docs"], True),
+        (["bug,docs"], ["bug", "docs", "wip"], True),
+        (["-wip"], ["bug"], True),                        # только запрет
+        (["-wip"], ["bug", "wip"], False),
+        (["-wip"], ["WIP"], False),                       # регистронезависимо
+        (["bug,-wip"], ["bug"], True),
+        (["bug,-wip"], ["bug", "wip"], False),
+        (["bug", "-wip"], ["bug", "docs"], True),          # повторный флаг
+        ([], ["anything"], True),                          # без фильтра
+        (["Bug,NEEDS-REVIEW"], ["bug", "needs-review"], True),
+    ],
+)
+def test_label_filter_matching(filter_args, labels, expected):
+    assert _orch(label=filter_args)._matches_filters(_pull_labels(labels)) is expected
+
+
+def test_label_filter_combination_with_assignee():
+    orch = _orch(label=["bug,-wip"], assignee="alice")
+    assert orch._matches_filters(_pull_labels(["bug"], ["alice"])) is True
+    assert orch._matches_filters(_pull_labels(["bug"], ["bob"])) is False
+    assert orch._matches_filters(_pull_labels(["bug", "wip"], ["alice"])) is False
+
+
+def test_label_filters_parsed_once(monkeypatch):
+    """Парсер вызывается один раз за прогон, а не на каждый PR."""
+    calls = []
+    real = app.parse_label_filters
+
+    def spy(value):
+        calls.append(value)
+        return real(value)
+
+    monkeypatch.setattr(app, "parse_label_filters", spy)
+    orch = _orch(label=["bug"])
+    for _ in range(5):
+        orch._matches_filters(_pull(["bug"]))
+    assert len(calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+#  --openai-api-token
+# --------------------------------------------------------------------------- #
+
+def test_openai_api_token_from_arg(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_TOKEN", raising=False)
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m",
+            "--prompt-file", "x", "--openai-api-token", "sk-abc"]
+    assert app.build_parser().parse_args(argv).openai_api_token == "sk-abc"
+
+
+def test_openai_api_token_from_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_TOKEN", "sk-from-env")
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", "x"]
+    assert app.build_parser().parse_args(argv).openai_api_token == "sk-from-env"
+
+
+def test_openai_api_token_absent(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_TOKEN", raising=False)
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", "x"]
+    assert app.build_parser().parse_args(argv).openai_api_token is None
+
+
+def test_llm_client_sends_bearer_token():
+    client = app.LLMClient(LLM_URL, "m", api_token="sk-secret")
+    assert client.session.headers["Authorization"] == "Bearer sk-secret"
+
+
+def test_llm_client_no_auth_header_without_token():
+    client = app.LLMClient(LLM_URL, "m")
+    assert "Authorization" not in client.session.headers
+
+    client = app.LLMClient(LLM_URL, "m", api_token="   ")
+    assert "Authorization" not in client.session.headers
+
+
+@responses.activate
+def test_llm_request_carries_auth_header():
+    responses.add(responses.POST, LLM_URL,
+                  json={"choices": [{"message": {"content": "ok"}}]})
+    client = app.LLMClient(LLM_URL, "m", timeout=5, show_stream=False, api_token="sk-live")
+    client.ask([{"role": "user", "content": "hi"}])
+    assert responses.calls[0].request.headers["Authorization"] == "Bearer sk-live"
+
+
+@responses.activate
+def test_forgejo_token_not_sent_to_llm(tmp_path, prompt_file):
+    """Токен Forgejo не должен утекать в запрос к LLM."""
+    out = tmp_path / "out"
+    sha = "beef01"
+    responses.add(responses.GET, f"{API}/repos/owner/repo", json={"full_name": "owner/repo"})
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls", json=[
+        {"number": 1, "title": "T", "labels": [], "assignees": [],
+         "head": {"sha": sha, "repo": {"full_name": "owner/repo"}}},
+    ])
+    for ep in ("commits", "files"):
+        responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/1/{ep}", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/1/comments", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/1/reviews", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/1/timeline", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/1.diff", body="",
+                  content_type="text/plain")
+    responses.add(responses.POST, LLM_URL,
+                  json={"choices": [{"message": {"content": "ok"}}]})
+
+    app.main([REPO_URL, "--token", "forgejo-secret", "--llm-url", LLM_URL,
+              "--model", "m", "--prompt-file", prompt_file,
+              "--output-dir", str(out)])
+
+    llm_calls = [c for c in responses.calls if c.request.url.startswith(LLM_URL)]
+    assert len(llm_calls) == 1
+    assert "Authorization" not in llm_calls[0].request.headers
+    body = llm_calls[0].request.body or b""
+    body_text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+    assert "forgejo-secret" not in body_text
+
+
+# --------------------------------------------------------------------------- #
+#  Краевые случаи разбора аргументов
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (["--label", "-wip"], ["--label=-wip"]),
+        (["--label=-wip"], ["--label=-wip"]),
+        (["--label", "bug,docs", "--label", "-wip"],
+         ["--label=bug,docs", "--label=-wip"]),
+        (["--model", "gpt-4o-mini"], ["--model=gpt-4o-mini"]),
+        (["--no-stream"], ["--no-stream"]),
+        # следующий токен — опция, склеивать нельзя: argparse должен ругаться
+        (["--label", "--dry-run"], ["--label", "--dry-run"]),
+        # всё после "--" не трогаем
+        (["--", "--label", "x"], ["--", "--label", "x"]),
+    ],
+)
+def test_normalize_argv(raw, expected):
+    assert app.normalize_argv(raw) == expected
+
+
+def test_label_dash_value_accepted():
+    """--label -wip не должен восприниматься как неизвестная опция."""
+    argv = app.normalize_argv(
+        [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m",
+         "--prompt-file", "x", "--label", "-wip"]
+    )
+    args = app.build_parser().parse_args(argv)
+    assert app.parse_label_filters(args.label) == ([], ["wip"])
+
+
+@pytest.mark.parametrize("empty", [[""], [" "], [" , "], [","]])
+def test_label_empty_value_is_error(empty):
+    """Пустое значение --label не должно молча означать «все PR»."""
+    with pytest.raises(app.ConfigError):
+        app.parse_label_filters(empty)
+
+
+def test_validate_args_rejects_bad_labels(prompt_file):
+    args = app.build_parser().parse_args(app.normalize_argv(
+        [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m",
+         "--prompt-file", prompt_file, "--label", "bug,-bug"]
+    ))
+    with pytest.raises(app.ConfigError):
+        app.validate_args(args)

@@ -35,7 +35,7 @@ from urllib.parse import quote, urlparse
 
 import requests
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 DEFAULT_LLM_TIMEOUT = 900          # 15 минут
 DEFAULT_PAGE_SIZE = 50
@@ -149,6 +149,72 @@ def atomic_write_json(path: str, payload: Any) -> None:
 
 def safe_filename_part(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "-", value or "unknown")[:120]
+
+
+def parse_label_filters(expressions: Iterable[str] | str | None) -> tuple[list[str], list[str]]:
+    """Разбирает выражения --label в (обязательные, запрещённые) метки.
+
+    Несколько меток можно задать через запятую в одном значении и/или
+    повторив флаг. Префикс ``-`` означает «метки быть не должно»::
+
+        "needs-review,bug,-wip"  ->  (["needs-review", "bug"], ["wip"])
+
+    Экранирование: ``\\-label`` или ``+label`` задают метку, начинающуюся
+    с дефиса. Пустые сегменты игнорируются.
+    """
+    if expressions is None:
+        raw_values: list[str] = []
+    elif isinstance(expressions, str):
+        raw_values = [expressions]
+    else:
+        raw_values = [e for e in expressions if e is not None]
+
+    required: list[str] = []
+    forbidden: list[str] = []
+
+    for value in raw_values:
+        if not value.strip():
+            raise ConfigError(
+                "Пустое значение --label: укажите метки, например --label=bug,-wip."
+            )
+        for raw in value.split(","):
+            token = raw.strip()
+            if not token:
+                continue  # пустые сегменты между запятыми допустимы
+
+            if token.startswith("\\") or token.startswith("+"):
+                token, target = token[1:], required
+            elif token.startswith("-"):
+                token, target = token[1:], forbidden
+            else:
+                target = required
+
+            token = token.strip()
+            if not token:
+                raise ConfigError(
+                    f"Пустое имя метки в --label: {value!r}. "
+                    f"Метку, начинающуюся с дефиса, экранируйте так: '\\-имя'."
+                )
+            target.append(token)
+
+    if raw_values and not (required or forbidden):
+        raise ConfigError(
+            "В --label не найдено ни одной метки. "
+            "Пример корректного значения: --label=bug,-wip."
+        )
+
+    # Дубликаты схлопываем, сохраняя порядок ввода
+    required = list(dict.fromkeys(required))
+    forbidden = list(dict.fromkeys(forbidden))
+
+    both = sorted(set(required) & set(forbidden), key=str.lower)
+    if both:
+        raise ConfigError("Метка одновременно требуется и запрещена: " + ", ".join(both))
+    return required, forbidden
+
+
+def format_label_filters(required: list[str], forbidden: list[str]) -> str:
+    return ", ".join(list(required) + [f"-{name}" for name in forbidden])
 
 
 def split_unified_diff(diff_text: str) -> dict[str, str]:
@@ -770,6 +836,7 @@ class LLMClient:
         retries: int = 3,
         show_stream: bool = True,
         max_prompt_bytes: int = DEFAULT_MAX_PROMPT_BYTES,
+        api_token: str | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.model = model
@@ -777,12 +844,16 @@ class LLMClient:
         self.retries = max(1, retries)
         self.show_stream = show_stream
         self.max_prompt_bytes = max_prompt_bytes
+        self.api_token = (api_token or "").strip() or None
         self.session = requests.Session()
-        self.session.headers.update({
+        headers = {
             "Content-Type": "application/json",
             "Accept": "text/event-stream, application/json",
             "User-Agent": f"forgejo-pr-llm/{__version__}",
-        })
+        }
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
+        self.session.headers.update(headers)
 
     def build_messages(self, system_prompt: str, pr_json: str) -> list[dict[str, str]]:
         return [
@@ -1062,15 +1133,30 @@ class Orchestrator:
 
     # -- фильтры ------------------------------------------------------------ #
 
+    def _label_filters(self) -> tuple[list[str], list[str]]:
+        """Разобранные label-фильтры; парсим один раз на прогон."""
+        cached = getattr(self, "_label_cache", None)
+        if cached is None:
+            cached = parse_label_filters(getattr(self.args, "label", None))
+            self._label_cache = cached
+        return cached
+
     def _matches_filters(self, pull: dict[str, Any]) -> bool:
-        if self.args.label:
+        required, forbidden = self._label_filters()
+        if required or forbidden:
             labels = {
-                (lbl.get("name") or "").lower()
+                (lbl.get("name") or "").strip().lower()
                 for lbl in (pull.get("labels") or [])
                 if isinstance(lbl, dict)
             }
-            if self.args.label.lower() not in labels:
-                return False
+            # все обязательные метки должны присутствовать (И)
+            for name in required:
+                if name.lower() not in labels:
+                    return False
+            # ни одной запрещённой быть не должно
+            for name in forbidden:
+                if name.lower() in labels:
+                    return False
 
         if self.args.assignee:
             wanted = self.args.assignee.lower()
@@ -1121,10 +1207,11 @@ class Orchestrator:
         log(f"Открытых PR: {len(pulls)}")
         selected = [p for p in pulls if self._matches_filters(p)]
         filtered_out = len(pulls) - len(selected)
-        if self.args.label or self.args.assignee:
+        required, forbidden = self._label_filters()
+        if required or forbidden or self.args.assignee:
             criteria = []
-            if self.args.label:
-                criteria.append(f"метка «{self.args.label}»")
+            if required or forbidden:
+                criteria.append(f"метки «{format_label_filters(required, forbidden)}»")
             if self.args.assignee:
                 criteria.append(f"assignee «{self.args.assignee}»")
             log(f"После фильтра (И: {', '.join(criteria)}): {len(selected)} "
@@ -1150,6 +1237,7 @@ class Orchestrator:
             retries=self.args.llm_retries,
             show_stream=not self.args.no_stream,
             max_prompt_bytes=self.args.max_prompt_bytes,
+            api_token=getattr(self.args, "openai_api_token", None),
         )
 
         collector = PRCollector(client, max_file_bytes=self.args.max_file_bytes)
@@ -1290,6 +1378,34 @@ class Orchestrator:
 #  CLI
 # --------------------------------------------------------------------------- #
 
+_VALUE_FLAGS = {"--label", "--assignee", "--token", "--llm-url", "--model",
+                "--prompt-file", "--output-dir", "--openai-api-token"}
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    """Склеивает ``--flag value`` в ``--flag=value`` для флагов со значением.
+
+    Нужно, чтобы принимать значения, начинающиеся с дефиса
+    (``--label -wip``), которые argparse иначе считает опциями. Явная
+    форма ``--label=-wip`` работает и без этой функции.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            result.extend(argv[i:])
+            break
+        if (token in _VALUE_FLAGS and i + 1 < len(argv)
+                and not argv[i + 1].startswith("--")):
+            result.append(f"{token}={argv[i + 1]}")
+            i += 2
+            continue
+        result.append(token)
+        i += 1
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="forgejo_pr_llm.py",
@@ -1309,6 +1425,17 @@ def build_parser() -> argparse.ArgumentParser:
             "      --llm-url http://localhost:11434/v1/chat/completions \\\n"
             "      --model qwen2.5-coder:14b --prompt-file prompt.txt \\\n"
             "      --label needs-review --assignee alice --output-dir ./out\n\n"
+            "  # несколько меток: нужны 'bug' и 'needs-review', не должно быть 'wip'\n"
+            "  %(prog)s https://forgejo.example.com/owner/repo --token $TOK \\\n"
+            "      --llm-url http://localhost:11434/v1/chat/completions \\\n"
+            "      --model qwen2.5-coder:14b --prompt-file prompt.txt \\\n"
+            "      --label bug,needs-review,-wip\n\n"
+            "  # то же самое отдельными флагами + токен для OpenAI-совместимого API\n"
+            "  %(prog)s https://forgejo.example.com/owner/repo --token $TOK \\\n"
+            "      --llm-url https://api.openai.com/v1/chat/completions \\\n"
+            "      --openai-api-token $OPENAI_API_TOKEN \\\n"
+            "      --model gpt-4o-mini --prompt-file prompt.txt \\\n"
+            "      --label bug --label needs-review --label=-wip\n\n"
             "Файлы: <N>_<sha>.json и answer_<N>_<sha>.txt\n"
             "Существующие файлы не перекачиваются (--refresh / --force-llm для повтора)."
         ),
@@ -1323,8 +1450,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Имя модели для LLM endpoint")
     parser.add_argument("--prompt-file", required=True, metavar="PATH",
                         help="Файл с текстом промпта (статическая инструкция)")
-    parser.add_argument("--label", default=None,
-                        help="Выгружать только PR с этой меткой")
+    parser.add_argument(
+        "--label", default=None, action="append", metavar="МЕТКИ",
+        help=(
+            "Фильтр по меткам. Несколько меток — через запятую или повторным "
+            "флагом. Метка без префикса обязательна (все условия по И), "
+            "префикс '-' исключает PR с этой меткой: --label=bug,-wip"
+        ),
+    )
+    parser.add_argument(
+        "--openai-api-token", default=os.environ.get("OPENAI_API_TOKEN"), metavar="TOKEN",
+        help=(
+            "Bearer-токен для LLM endpoint (заголовок Authorization). "
+            "По умолчанию $OPENAI_API_TOKEN; если пусто — не отправляется"
+        ),
+    )
     parser.add_argument("--assignee", default=None,
                         help="Выгружать только PR с этим assignee (логин)")
 
@@ -1370,11 +1510,13 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ConfigError("--max-file-bytes не может быть отрицательным.")
     if not os.path.isfile(args.prompt_file):
         raise ConfigError(f"--prompt-file не найден: {args.prompt_file}")
+    parse_label_filters(args.label)  # ранняя проверка синтаксиса
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(normalize_argv(raw))
 
     try:
         validate_args(args)
