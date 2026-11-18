@@ -35,7 +35,7 @@ from urllib.parse import quote, urlparse
 
 import requests
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DEFAULT_LLM_TIMEOUT = 900  # 15 минут
 DEFAULT_PAGE_SIZE = 50
@@ -575,10 +575,14 @@ class PRCollector:
         *,
         max_file_bytes: int,
         max_diff_bytes: int = MAX_UNIFIED_DIFF_BYTES,
+        light_pr: bool = False,
+        comment_filter: tuple[list[str], list[str]] | None = None,
     ) -> None:
         self.client = client
         self.max_file_bytes = max_file_bytes
         self.max_diff_bytes = max_diff_bytes
+        self.light_pr = light_pr
+        self.comment_filter = comment_filter
 
     def collect(
         self,
@@ -618,9 +622,30 @@ class PRCollector:
 
         review_comments = self._collect_review_comments(owner, repo, index, reviews, errors, warnings)
 
+        # Фильтрация комментариев по авторам (--comment-filter)
+        if self.comment_filter is not None:
+            issue_comments = self._filter_comments(issue_comments, self.comment_filter)
+            review_comments = self._filter_comments(review_comments, self.comment_filter)
+
         head_sha = (pull.get("head") or {}).get("sha") or ""
         head_repo = (pull.get("head") or {}).get("repo") or {}
         head_full_name = head_repo.get("full_name") or f"{owner}/{repo}"
+
+        # Облегчённый режим: только файлы и незакрытые review-комментарии
+        if self.light_pr:
+            return self._collect_light(
+                pull,
+                index,
+                owner,
+                repo,
+                base_url,
+                head_sha,
+                head_full_name,
+                files,
+                review_comments,
+                errors,
+                warnings,
+            )
 
         # Патчи, обрезанные сервером, добираем из общего .diff
         diff_text = guard("diff", lambda: self.client.get_pull_diff(owner, repo, index), None)
@@ -707,6 +732,126 @@ class PRCollector:
                 c.setdefault("_review_id", rid)
                 collected.append(c)
         return collected
+
+    @staticmethod
+    def _filter_comments(
+        comments: list[dict[str, Any]],
+        filter_spec: tuple[list[str], list[str]],
+    ) -> list[dict[str, Any]]:
+        """Оставляет только комментарии от заданных авторов.
+
+        required — оставить только этих (ИЛИ); forbidden — исключить этих.
+        """
+        required, forbidden = filter_spec
+        req_set = {u.lower() for u in required}
+        forb_set = {u.lower() for u in forbidden}
+        result: list[dict[str, Any]] = []
+        for c in comments:
+            user = c.get("user") or {}
+            login = (user.get("login") or "").lower() if isinstance(user, dict) else ""
+            if forb_set and login in forb_set:
+                continue
+            if req_set and login not in req_set:
+                continue
+            result.append(c)
+        return result
+
+    def _collect_light(
+        self,
+        pull: dict[str, Any],
+        index: int,
+        owner: str,
+        repo: str,
+        base_url: str,
+        head_sha: str,
+        head_full_name: str,
+        files: list[dict[str, Any]],
+        review_comments: list[dict[str, Any]],
+        errors: list[dict[str, Any]],
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        """Облегчённый снимок: файлы с патчами + незакрытые inline-комментарии.
+
+        Не включает: полное содержимое файлов, коммиты, timeline, общий дифф.
+        Незакрытые = review-комментарии у которых resolved_at is None.
+        """
+        diff_text: str | None = None
+        try:
+            diff_text = self.client.get_pull_diff(owner, repo, index)
+        except ForgejoError as exc:
+            errors.append({"endpoint": "diff", "status": exc.status, "message": str(exc)})
+            warnings.append(f"PR #{index}: не удалось получить дифф ({exc.status})")
+
+        diff_parts: dict[str, str] = {}
+        if diff_text:
+            diff_parts = split_unified_diff(diff_text)
+
+        light_files: list[dict[str, Any]] = []
+        for f in files:
+            fname = f.get("filename") or ""
+            patch = f.get("patch") or ""
+            patch_source = "api" if patch else None
+            if not patch and fname in diff_parts:
+                patch = diff_parts[fname]
+                patch_source = "unified_diff"
+            light_files.append(
+                {
+                    "filename": fname,
+                    "status": f.get("status"),
+                    "additions": f.get("additions"),
+                    "deletions": f.get("deletions"),
+                    "changes": f.get("changes"),
+                    "patch": patch,
+                    "patch_source": patch_source,
+                }
+            )
+
+        # Оставляем только незакрытые (resolved_at is None) review-комментарии
+        open_review_comments: list[dict[str, Any]] = []
+        for rc in review_comments:
+            if rc.get("resolved_at") is not None:
+                continue
+            user_obj = rc.get("user") or {}
+            open_review_comments.append(
+                {
+                    "id": rc.get("id"),
+                    "user": user_obj.get("login") if isinstance(user_obj, dict) else None,
+                    "path": rc.get("path"),
+                    "line": rc.get("line"),
+                    "original_line": rc.get("original_line"),
+                    "diff_hunk": rc.get("diff_hunk"),
+                    "body": rc.get("body"),
+                    "created_at": rc.get("created_at"),
+                    "review_id": rc.get("_review_id"),
+                }
+            )
+
+        user_obj = pull.get("user") or {}
+        return {
+            "schema_version": "1.0-light",
+            "mode": "light",
+            "fetched_at": utc_now(),
+            "generator": f"forgejo-pr-llm/{__version__}",
+            "source": {"base_url": base_url, "owner": owner, "repo": repo},
+            "pr_number": index,
+            "head_sha": head_sha,
+            "counts": {
+                "files": len(light_files),
+                "open_review_comments": len(open_review_comments),
+            },
+            "pull_request": {
+                "number": pull.get("number"),
+                "title": pull.get("title"),
+                "state": pull.get("state"),
+                "user": user_obj.get("login") if isinstance(user_obj, dict) else None,
+                "labels": [lbl.get("name") for lbl in (pull.get("labels") or []) if isinstance(lbl, dict)],
+                "head": pull.get("head"),
+                "base": pull.get("base"),
+            },
+            "files": light_files,
+            "review_comments": open_review_comments,
+            "fetch_errors": errors,
+        }
 
     def _enrich_file(
         self,
@@ -1184,6 +1329,18 @@ class Orchestrator:
             self._label_cache = cached
         return cached
 
+    def _comment_filter(self) -> tuple[list[str], list[str]] | None:
+        """Разобранный comment-filter; None если флаг не задан."""
+        raw = getattr(self.args, "comment_filter", None)
+        if not raw:
+            return None
+        cached = getattr(self, "_comment_filter_cache", None)
+        if cached is None:
+            required, forbidden = parse_label_filters(raw)
+            cached = (required, forbidden) if (required or forbidden) else None
+            self._comment_filter_cache = cached
+        return cached
+
     def _matches_filters(self, pull: dict[str, Any]) -> bool:
         required, forbidden = self._label_filters()
         if required or forbidden:
@@ -1275,7 +1432,12 @@ class Orchestrator:
             api_token=getattr(self.args, "openai_api_token", None),
         )
 
-        collector = PRCollector(client, max_file_bytes=self.args.max_file_bytes)
+        collector = PRCollector(
+            client,
+            max_file_bytes=self.args.max_file_bytes,
+            light_pr=getattr(self.args, "light_pr", False),
+            comment_filter=self._comment_filter(),
+        )
         self.stats["prs_total"] = len(selected)
 
         for position, pull in enumerate(selected, start=1):
@@ -1290,7 +1452,8 @@ class Orchestrator:
             json_path = os.path.join(self.output_dir, self.json_name(index, sha))
             answer_path = os.path.join(self.output_dir, self.answer_name(index, sha))
 
-            log(f"\n{prefix} (sha {sha[:12]}) — {pull.get('title')}")
+            mode_tag = " [light]" if getattr(self.args, "light_pr", False) else ""
+            log(f"\n{prefix} (sha {sha[:12]}){mode_tag} — {pull.get('title')}")
 
             pr_payload: dict[str, Any] | None = None
             if os.path.exists(json_path) and not self.args.refresh:
@@ -1425,6 +1588,7 @@ _VALUE_FLAGS = {
     "--prompt-file",
     "--output-dir",
     "--openai-api-token",
+    "--comment-filter",
 }
 
 
@@ -1481,6 +1645,11 @@ def build_parser() -> argparse.ArgumentParser:
             "      --openai-api-token $OPENAI_API_TOKEN \\\n"
             "      --model gpt-4o-mini --prompt-file prompt.txt \\\n"
             "      --label bug --label needs-review --label=-wip\n\n"
+            "  # облегчённый режим + фильтр комментариев\n"
+            "  %(prog)s https://forgejo.example.com/owner/repo --token $TOK \\\n"
+            "      --llm-url http://localhost:11434/v1/chat/completions \\\n"
+            "      --model qwen2.5-coder:14b --prompt-file prompt.txt \\\n"
+            "      --light-pr --comment-filter alice,bob,-bot\n\n"
             "Файлы: <N>_<sha>.json и answer_<N>_<sha>.txt\n"
             "Существующие файлы не перекачиваются (--refresh / --force-llm для повтора)."
         ),
@@ -1517,6 +1686,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Bearer-токен для LLM endpoint (заголовок Authorization). "
             "По умолчанию $OPENAI_API_TOKEN; если пусто — не отправляется"
+        ),
+    )
+    parser.add_argument(
+        "--light-pr",
+        action="store_true",
+        help=(
+            "Облегчённый формат снимка: только затронутые файлы (с патчами) "
+            "и незакрытые review-комментарии с указанием строк. "
+            "Без содержимого файлов, коммитов, timeline и общего диффа"
+        ),
+    )
+    parser.add_argument(
+        "--comment-filter",
+        default=None,
+        action="append",
+        metavar="ПОЛЬЗОВАТЕЛИ",
+        help=(
+            "Фильтр комментариев по авторам. Синтаксис как у --label: "
+            "список через запятую или повторный флаг, префикс '-' исключает автора. "
+            "Применяется в любом режиме сохранения PR"
         ),
     )
     parser.add_argument("--assignee", default=None, help="Выгружать только PR с этим assignee (логин)")
@@ -1577,6 +1766,8 @@ def validate_args(args: argparse.Namespace) -> None:
     if not os.path.isfile(args.prompt_file):
         raise ConfigError(f"--prompt-file не найден: {args.prompt_file}")
     parse_label_filters(args.label)  # ранняя проверка синтаксиса
+    if getattr(args, "comment_filter", None) is not None:
+        parse_label_filters(args.comment_filter)  # ранняя проверка синтаксиса
 
 
 def main(argv: list[str] | None = None) -> int:

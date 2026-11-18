@@ -1042,3 +1042,311 @@ def test_validate_args_rejects_bad_labels(prompt_file):
     )
     with pytest.raises(app.ConfigError):
         app.validate_args(args)
+
+
+# --------------------------------------------------------------------------- #
+#  --light-pr: облегчённый формат снимка
+# --------------------------------------------------------------------------- #
+
+
+@responses.activate
+def test_light_pr_mode_produces_compact_snapshot():
+    """light_pr=True: файлы с патчами, незакрытые review-комментарии, без content/commits/timeline."""
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/7/commits", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/7/files", json=[_file_entry()])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/7/comments", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/7/timeline", json=[])
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7.diff",
+        body="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n"
+        "+++ b/src/app.py\n@@ -1 +1,2 @@\n-old\n+new\n+more\n",
+        content_type="text/plain",
+    )
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7/reviews",
+        json=[{"id": 99, "state": "APPROVED", "user": {"login": "carol"}}],
+    )
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7/reviews/99/comments",
+        json=[
+            {
+                "id": 1,
+                "path": "src/app.py",
+                "line": 2,
+                "original_line": 1,
+                "body": "open comment",
+                "user": {"login": "carol"},
+                "created_at": "2026-01-01T00:00:00Z",
+                "resolved_at": None,
+            },
+            {
+                "id": 2,
+                "path": "src/app.py",
+                "line": 3,
+                "original_line": 1,
+                "body": "resolved comment",
+                "user": {"login": "dave"},
+                "created_at": "2026-01-02T00:00:00Z",
+                "resolved_at": "2026-01-03T00:00:00Z",
+            },
+        ],
+    )
+
+    client = app.ForgejoClient(API, "tok", verbose=False)
+    collector = app.PRCollector(client, max_file_bytes=1024, light_pr=True)
+    snap = collector.collect("owner", "repo", _pull(), base_url="https://x", warnings=[])
+
+    assert snap["mode"] == "light"
+    assert snap["schema_version"] == "1.0-light"
+    # Нет тяжёлых секций
+    assert "commits" not in snap
+    assert "timeline" not in snap
+    assert "unified_diff" not in snap
+    assert "issue_comments" not in snap
+    # Файлы есть, с патчем, но без content
+    assert len(snap["files"]) == 1
+    f = snap["files"][0]
+    assert f["filename"] == "src/app.py"
+    assert f["patch"] != ""
+    assert "content" not in f
+    # Только незакрытый комментарий
+    comments = snap["review_comments"]
+    assert len(comments) == 1
+    assert comments[0]["body"] == "open comment"
+    assert comments[0]["path"] == "src/app.py"
+    assert comments[0]["line"] == 2
+    assert comments[0]["user"] == "carol"
+    assert comments[0]["review_id"] == 99
+
+
+@responses.activate
+def test_light_pr_excludes_resolved_comments():
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/7/commits", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/7/files", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/7/comments", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/7/timeline", json=[])
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7/reviews",
+        json=[{"id": 99, "state": "COMMENTED", "user": {"login": "x"}}],
+    )
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7/reviews/99/comments",
+        json=[
+            {"id": 1, "path": "a.py", "line": 1, "body": "open", "user": {"login": "x"}, "resolved_at": None},
+            {"id": 2, "path": "b.py", "line": 2, "body": "closed", "user": {"login": "y"}, "resolved_at": "2026-01-01"},
+            {"id": 3, "path": "c.py", "line": 3, "body": "also open", "user": {"login": "z"}, "resolved_at": None},
+        ],
+    )
+
+    client = app.ForgejoClient(API, "tok", verbose=False)
+    snap = app.PRCollector(client, max_file_bytes=1024, light_pr=True).collect(
+        "owner", "repo", _pull(), base_url="x", warnings=[]
+    )
+    bodies = [c["body"] for c in snap["review_comments"]]
+    assert "closed" not in bodies
+    assert "open" in bodies
+    assert "also open" in bodies
+
+
+# --------------------------------------------------------------------------- #
+#  --comment-filter: фильтр комментариев по авторам
+# --------------------------------------------------------------------------- #
+
+
+def test_filter_comments_keeps_only_required():
+    comments = [
+        {"user": {"login": "alice"}, "body": "1"},
+        {"user": {"login": "bob"}, "body": "2"},
+        {"user": {"login": "carol"}, "body": "3"},
+    ]
+    result = app.PRCollector._filter_comments(comments, (["alice"], []))
+    assert [c["body"] for c in result] == ["1"]
+
+
+def test_filter_comments_excludes_forbidden():
+    comments = [
+        {"user": {"login": "alice"}, "body": "1"},
+        {"user": {"login": "bot"}, "body": "2"},
+        {"user": {"login": "carol"}, "body": "3"},
+    ]
+    result = app.PRCollector._filter_comments(comments, ([], ["bot"]))
+    assert [c["body"] for c in result] == ["1", "3"]
+
+
+def test_filter_comments_combined_required_and_forbidden():
+    comments = [
+        {"user": {"login": "alice"}, "body": "1"},
+        {"user": {"login": "bob"}, "body": "2"},
+        {"user": {"login": "bot"}, "body": "3"},
+    ]
+    result = app.PRCollector._filter_comments(comments, (["alice", "bob"], ["bot"]))
+    assert [c["body"] for c in result] == ["1", "2"]
+
+
+def test_filter_comments_case_insensitive():
+    comments = [{"user": {"login": "Alice"}, "body": "1"}]
+    result = app.PRCollector._filter_comments(comments, (["alice"], []))
+    assert len(result) == 1
+
+
+def test_filter_comments_empty_required_keeps_all():
+    comments = [{"user": {"login": "a"}, "body": "1"}, {"user": {"login": "b"}, "body": "2"}]
+    result = app.PRCollector._filter_comments(comments, ([], []))
+    assert len(result) == 2
+
+
+@responses.activate
+def test_comment_filter_in_full_mode():
+    """comment_filter применяется и в полном режиме: issue_comments + review_comments фильтруются."""
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/7/commits", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/7/files", json=[])
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/issues/7/comments",
+        json=[
+            {"id": 1, "user": {"login": "alice"}, "body": "keep", "created_at": "2026-01-01"},
+            {"id": 2, "user": {"login": "bot"}, "body": "drop", "created_at": "2026-01-02"},
+        ],
+    )
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/7/timeline", json=[])
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7/reviews",
+        json=[{"id": 50, "state": "COMMENTED", "user": {"login": "x"}}],
+    )
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7/reviews/50/comments",
+        json=[
+            {
+                "id": 10,
+                "user": {"login": "alice"},
+                "path": "a.py",
+                "line": 1,
+                "body": "inline-keep",
+                "resolved_at": None,
+            },
+            {"id": 11, "user": {"login": "bot"}, "path": "a.py", "line": 2, "body": "inline-drop", "resolved_at": None},
+        ],
+    )
+
+    client = app.ForgejoClient(API, "tok", verbose=False)
+    cf = (["alice"], ["bot"])
+    collector = app.PRCollector(client, max_file_bytes=1024, comment_filter=cf)
+    snap = collector.collect("owner", "repo", _pull(), base_url="x", warnings=[])
+
+    issue_bodies = [c["body"] for c in snap["issue_comments"]]
+    assert "keep" in issue_bodies
+    assert "drop" not in issue_bodies
+
+    review_bodies = [c["body"] for c in snap["review_comments"]]
+    assert "inline-keep" in review_bodies
+    assert "inline-drop" not in review_bodies
+
+
+@responses.activate
+def test_comment_filter_in_light_mode():
+    """comment_filter отсекает review-комментарии и в light-режиме."""
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/7/commits", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/7/files", json=[])
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/issues/7/comments",
+        json=[{"id": 1, "user": {"login": "bot"}, "body": "noise"}],
+    )
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/7/timeline", json=[])
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7/reviews",
+        json=[{"id": 60, "state": "COMMENTED", "user": {"login": "x"}}],
+    )
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls/7/reviews/60/comments",
+        json=[
+            {"id": 20, "user": {"login": "alice"}, "path": "a.py", "line": 1, "body": "keep", "resolved_at": None},
+            {"id": 21, "user": {"login": "bot"}, "path": "a.py", "line": 2, "body": "drop", "resolved_at": None},
+        ],
+    )
+
+    client = app.ForgejoClient(API, "tok", verbose=False)
+    cf = (["alice"], [])
+    collector = app.PRCollector(client, max_file_bytes=1024, light_pr=True, comment_filter=cf)
+    snap = collector.collect("owner", "repo", _pull(), base_url="x", warnings=[])
+
+    bodies = [c["body"] for c in snap["review_comments"]]
+    assert bodies == ["keep"]
+
+
+# --------------------------------------------------------------------------- #
+#  CLI: --light-pr и --comment-filter
+# --------------------------------------------------------------------------- #
+
+
+def test_light_pr_flag_default_false():
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", "x"]
+    assert app.build_parser().parse_args(app.normalize_argv(argv)).light_pr is False
+
+
+def test_light_pr_flag_set_true():
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", "x", "--light-pr"]
+    assert app.build_parser().parse_args(app.normalize_argv(argv)).light_pr is True
+
+
+def test_comment_filter_parse():
+    argv = app.normalize_argv(
+        [
+            REPO_URL,
+            "--token",
+            "t",
+            "--llm-url",
+            "u",
+            "--model",
+            "m",
+            "--prompt-file",
+            "x",
+            "--comment-filter",
+            "alice,bob,-bot",
+        ]
+    )
+    args = app.build_parser().parse_args(argv)
+    assert args.comment_filter == ["alice,bob,-bot"]
+    req, forb = app.parse_label_filters(args.comment_filter)
+    assert req == ["alice", "bob"]
+    assert forb == ["bot"]
+
+
+def test_comment_filter_repeated_flag():
+    argv = app.normalize_argv(
+        [
+            REPO_URL,
+            "--token",
+            "t",
+            "--llm-url",
+            "u",
+            "--model",
+            "m",
+            "--prompt-file",
+            "x",
+            "--comment-filter",
+            "alice",
+            "--comment-filter",
+            "-bot",
+        ]
+    )
+    args = app.build_parser().parse_args(argv)
+    req, forb = app.parse_label_filters(args.comment_filter)
+    assert req == ["alice"]
+    assert forb == ["bot"]
+
+
+def test_comment_filter_empty_is_none():
+    """Нет --comment-filter -> None, не ошибка."""
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", "x"]
+    args = app.build_parser().parse_args(argv)
+    assert args.comment_filter is None
