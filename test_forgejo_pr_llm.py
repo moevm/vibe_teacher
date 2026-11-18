@@ -1359,8 +1359,12 @@ def test_comment_filter_empty_is_none():
 
 def test_format_counts_full_mode():
     counts = {
-        "commits": 3, "files": 5, "issue_comments": 2,
-        "reviews": 1, "review_comments": 4, "timeline_events": 17,
+        "commits": 3,
+        "files": 5,
+        "issue_comments": 2,
+        "reviews": 1,
+        "review_comments": 4,
+        "timeline_events": 17,
     }
     text = app.format_counts(counts)
     assert "коммитов 3" in text
@@ -1401,30 +1405,40 @@ def test_e2e_light_pr_does_not_crash_on_counts(tmp_path, prompt_file):
     out = tmp_path / "out"
     sha = "0dca9c8787b8"
     pull = {
-        "number": 54, "title": "Luchkin_MA_1", "state": "open",
-        "labels": [], "assignees": [],
+        "number": 54,
+        "title": "Luchkin_MA_1",
+        "state": "open",
+        "labels": [],
+        "assignees": [],
         "head": {"sha": sha, "repo": {"full_name": "owner/repo"}},
         "base": {"ref": "main", "repo": {"full_name": "owner/repo"}},
     }
-    responses.add(responses.GET, f"{API}/repos/owner/repo",
-                  json={"full_name": "owner/repo", "empty": False})
+    responses.add(responses.GET, f"{API}/repos/owner/repo", json={"full_name": "owner/repo", "empty": False})
     responses.add(responses.GET, f"{API}/repos/owner/repo/pulls", json=[pull])
     responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/54/commits", json=[])
-    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/54/files",
-                  json=[_file_entry()])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/54/files", json=[_file_entry()])
     responses.add(responses.GET, f"{API}/repos/owner/repo/issues/54/comments", json=[])
     responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/54/reviews", json=[])
     responses.add(responses.GET, f"{API}/repos/owner/repo/issues/54/timeline", json=[])
-    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/54.diff",
-                  body="", content_type="text/plain")
-    responses.add(responses.POST, LLM_URL,
-                  json={"choices": [{"message": {"content": "ok"}}]})
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/54.diff", body="", content_type="text/plain")
+    responses.add(responses.POST, LLM_URL, json={"choices": [{"message": {"content": "ok"}}]})
 
-    code = app.main([
-        REPO_URL, "--token", "tok", "--llm-url", LLM_URL,
-        "--model", "m", "--prompt-file", prompt_file,
-        "--output-dir", str(out), "--light-pr",
-    ])
+    code = app.main(
+        [
+            REPO_URL,
+            "--token",
+            "tok",
+            "--llm-url",
+            LLM_URL,
+            "--model",
+            "m",
+            "--prompt-file",
+            prompt_file,
+            "--output-dir",
+            str(out),
+            "--light-pr",
+        ]
+    )
 
     assert code == 0
     json_path = out / f"54_{sha}.json"
@@ -1443,29 +1457,40 @@ def test_e2e_full_mode_still_logs_all_counts(tmp_path, prompt_file, capsys):
     out = tmp_path / "out"
     sha = "beef99"
     pull = {
-        "number": 3, "title": "Full", "state": "open",
-        "labels": [], "assignees": [],
+        "number": 3,
+        "title": "Full",
+        "state": "open",
+        "labels": [],
+        "assignees": [],
         "head": {"sha": sha, "repo": {"full_name": "owner/repo"}},
         "base": {"ref": "main", "repo": {"full_name": "owner/repo"}},
     }
-    responses.add(responses.GET, f"{API}/repos/owner/repo",
-                  json={"full_name": "owner/repo", "empty": False})
+    responses.add(responses.GET, f"{API}/repos/owner/repo", json={"full_name": "owner/repo", "empty": False})
     responses.add(responses.GET, f"{API}/repos/owner/repo/pulls", json=[pull])
-    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/3/commits",
-                  json=[{"sha": sha, "commit": {"message": "x"}}])
+    responses.add(
+        responses.GET, f"{API}/repos/owner/repo/pulls/3/commits", json=[{"sha": sha, "commit": {"message": "x"}}]
+    )
     responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/3/files", json=[])
     responses.add(responses.GET, f"{API}/repos/owner/repo/issues/3/comments", json=[])
     responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/3/reviews", json=[])
     responses.add(responses.GET, f"{API}/repos/owner/repo/issues/3/timeline", json=[])
-    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/3.diff",
-                  body="", content_type="text/plain")
-    responses.add(responses.POST, LLM_URL,
-                  json={"choices": [{"message": {"content": "ok"}}]})
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/3.diff", body="", content_type="text/plain")
+    responses.add(responses.POST, LLM_URL, json={"choices": [{"message": {"content": "ok"}}]})
 
-    code = app.main([
-        REPO_URL, "--token", "tok", "--llm-url", LLM_URL,
-        "--model", "m", "--prompt-file", prompt_file,
-        "--output-dir", str(out),
-    ])
+    code = app.main(
+        [
+            REPO_URL,
+            "--token",
+            "tok",
+            "--llm-url",
+            LLM_URL,
+            "--model",
+            "m",
+            "--prompt-file",
+            prompt_file,
+            "--output-dir",
+            str(out),
+        ]
+    )
     assert code == 0
     assert (out / f"3_{sha}.json").exists()
