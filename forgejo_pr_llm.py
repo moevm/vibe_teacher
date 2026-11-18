@@ -101,6 +101,37 @@ def human_bytes(n: int) -> str:
     return f"{n:.1f} ГБ"
 
 
+_COUNT_LABELS = {
+    "commits": "коммитов",
+    "files": "файлов",
+    "issue_comments": "комментариев",
+    "reviews": "ревью",
+    "review_comments": "inline-комментариев",
+    "timeline_events": "событий",
+    "open_review_comments": "незакрытых комментариев",
+}
+
+
+def format_counts(counts: dict[str, Any] | None) -> str:
+    """Человекочитаемая сводка по словарю counts.
+
+    Формат counts зависит от режима (полный / --light-pr), поэтому ключи
+    перебираем по известному словарю подписей, а необработанные добавляем в
+    конец. Функция не падает на любом наборе ключей — именно это и было
+    причиной KeyError при переходе на облегчённый формат.
+    """
+    if not counts:
+        return ""
+    parts: list[str] = []
+    for key, label in _COUNT_LABELS.items():
+        if key in counts:
+            parts.append(f"{label} {counts[key]}")
+    for key, value in counts.items():
+        if key not in _COUNT_LABELS:
+            parts.append(f"{key} {value}")
+    return ", ".join(parts)
+
+
 def parse_repo_url(raw: str) -> tuple[str, str, str]:
     """https://host/[subpath/]owner/repo[/...] -> (base_url, owner, repo).
 
@@ -1480,14 +1511,13 @@ class Orchestrator:
                     self.stats["failures"] += 1
                     continue
                 self.stats["json_written"] += 1
-                counts = pr_payload["counts"]
-                log(
-                    f"    · JSON сохранён: {os.path.basename(json_path)} "
-                    f"({human_bytes(os.path.getsize(json_path))}; "
-                    f"коммитов {counts['commits']}, файлов {counts['files']}, "
-                    f"комментариев {counts['issue_comments']}, "
-                    f"ревью {counts['reviews']}, событий {counts['timeline_events']})"
-                )
+                # counts отличается между полным и облегчённым режимом,
+                # поэтому собираем сводку из тех ключей, что реально есть
+                counts_summary = format_counts(pr_payload.get("counts"))
+                details = human_bytes(os.path.getsize(json_path))
+                if counts_summary:
+                    details += f"; {counts_summary}"
+                log(f"    · JSON сохранён: {os.path.basename(json_path)} ({details})")
 
             if os.path.exists(answer_path) and not self.args.force_llm:
                 log(f"    · ответ LLM уже есть: {os.path.basename(answer_path)}")
