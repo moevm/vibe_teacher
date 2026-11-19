@@ -1396,6 +1396,11 @@ class Orchestrator:
             if wanted not in logins:
                 return False
 
+        if self.args.title_contains:
+            title = (pull.get("title") or "").lower()
+            if self.args.title_contains.lower() not in title:
+                return False
+
         return True
 
     # -- основной поток ----------------------------------------------------- #
@@ -1432,12 +1437,14 @@ class Orchestrator:
         selected = [p for p in pulls if self._matches_filters(p)]
         filtered_out = len(pulls) - len(selected)
         required, forbidden = self._label_filters()
-        if required or forbidden or self.args.assignee:
+        if required or forbidden or self.args.assignee or self.args.title_contains:
             criteria = []
             if required or forbidden:
                 criteria.append(f"метки «{format_label_filters(required, forbidden)}»")
             if self.args.assignee:
                 criteria.append(f"assignee «{self.args.assignee}»")
+            if self.args.title_contains:
+                criteria.append(f"заголовок содержит «{self.args.title_contains}»")
             log(f"После фильтра (И: {', '.join(criteria)}): {len(selected)} (отсеяно {filtered_out})")
 
         if not selected:
@@ -1619,6 +1626,7 @@ _VALUE_FLAGS = {
     "--output-dir",
     "--openai-api-token",
     "--comment-filter",
+    "--title-contains",
 }
 
 
@@ -1738,6 +1746,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Применяется в любом режиме сохранения PR"
         ),
     )
+    parser.add_argument(
+        "--title-contains",
+        default=None,
+        metavar="ПОДСТРОКА",
+        help=(
+            "Только PR, в заголовке которых есть подстрока (без учёта регистра). "
+            "Сочетается с --label и --assignee по логике И"
+        ),
+    )
     parser.add_argument("--assignee", default=None, help="Выгружать только PR с этим assignee (логин)")
 
     group = parser.add_argument_group("вывод")
@@ -1798,6 +1815,8 @@ def validate_args(args: argparse.Namespace) -> None:
     parse_label_filters(args.label)  # ранняя проверка синтаксиса
     if getattr(args, "comment_filter", None) is not None:
         parse_label_filters(args.comment_filter)  # ранняя проверка синтаксиса
+    if args.title_contains is not None and not args.title_contains.strip():
+        raise ConfigError("Пустое значение --title-contains: укажите подстроку, например --title-contains=fix.")
 
 
 def main(argv: list[str] | None = None) -> int:

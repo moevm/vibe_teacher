@@ -815,13 +815,15 @@ def test_format_label_filters():
     assert app.format_label_filters(["bug"], []) == "bug"
 
 
-def _orch(label=None, assignee=None):
+def _orch(label=None, assignee=None, title_contains=None):
     argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", "x"]
     if label is not None:
         for value in label:
             argv += ["--label", value]
     if assignee:
         argv += ["--assignee", assignee]
+    if title_contains is not None:
+        argv += ["--title-contains", title_contains]
     args = app.build_parser().parse_args(app.normalize_argv(argv))
     return app.Orchestrator(args, "https://h", "o", "r")
 
@@ -858,6 +860,75 @@ def test_label_filter_combination_with_assignee():
     assert orch._matches_filters(_pull_labels(["bug"], ["alice"])) is True
     assert orch._matches_filters(_pull_labels(["bug"], ["bob"])) is False
     assert orch._matches_filters(_pull_labels(["bug", "wip"], ["alice"])) is False
+
+
+@pytest.mark.parametrize(
+    "substring,title,expected",
+    [
+        ("fix", "Fix login form", True),
+        ("FIX", "fix: typo", True),
+        ("login form", "Fix login form", True),
+        ("-wip", "WIP: refactor -wip", True),
+        ("fix", "Update README", False),
+        ("fix", "", False),
+        ("fix", None, False),
+    ],
+)
+def test_title_contains_matching(substring, title, expected):
+    assert _orch(title_contains=substring)._matches_filters({"title": title}) is expected
+
+
+def test_title_contains_combined_with_label_and_assignee():
+    orch = _orch(label=["bug,-wip"], assignee="alice", title_contains="fix")
+    pull = {"title": "Fix login", **_pull_labels(["bug"], ["alice"])}
+    assert orch._matches_filters(pull) is True
+    assert orch._matches_filters({**pull, "title": "Update README"}) is False
+    assert orch._matches_filters({**pull, **_pull_labels(["bug", "wip"], ["alice"])}) is False
+    assert orch._matches_filters({**pull, **_pull_labels(["bug"], ["bob"])}) is False
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_title_contains_rejects_blank(prompt_file, value):
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", prompt_file]
+    args = app.build_parser().parse_args(app.normalize_argv(argv + ["--title-contains", value]))
+    with pytest.raises(app.ConfigError, match="--title-contains"):
+        app.validate_args(args)
+
+
+@responses.activate
+def test_title_contains_dry_run_lists_only_matching(prompt_file, capsys):
+    responses.add(responses.GET, f"{API}/repos/owner/repo", json={"full_name": "owner/repo"})
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls",
+        json=[
+            {"number": 1, "title": "Fix login form", "head": {"sha": "aa1111"}},
+            {"number": 2, "title": "Update README", "head": {"sha": "bb2222"}},
+            {"number": 3, "title": "FIX typo in docs", "head": {"sha": "cc3333"}},
+        ],
+    )
+    code = app.main(
+        [
+            REPO_URL,
+            "--token",
+            "tok",
+            "--llm-url",
+            LLM_URL,
+            "--model",
+            "m",
+            "--prompt-file",
+            prompt_file,
+            "--title-contains",
+            "fix",
+            "--dry-run",
+        ]
+    )
+    err = capsys.readouterr().err
+    assert code == 0
+    assert "#   1 [aa1111] Fix login form" in err
+    assert "#   3 [cc3333] FIX typo in docs" in err
+    assert "#   2" not in err
+    assert "заголовок содержит «fix»" in err
 
 
 def test_label_filters_parsed_once(monkeypatch):
@@ -995,6 +1066,7 @@ def test_forgejo_token_not_sent_to_llm(tmp_path, prompt_file):
         (["--label=-wip"], ["--label=-wip"]),
         (["--label", "bug,docs", "--label", "-wip"], ["--label=bug,docs", "--label=-wip"]),
         (["--model", "gpt-4o-mini"], ["--model=gpt-4o-mini"]),
+        (["--title-contains", "-wip"], ["--title-contains=-wip"]),
         (["--no-stream"], ["--no-stream"]),
         # следующий токен — опция, склеивать нельзя: argparse должен ругаться
         (["--label", "--dry-run"], ["--label", "--dry-run"]),
