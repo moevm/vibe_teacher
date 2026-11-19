@@ -14,6 +14,7 @@
 Выходные файлы (в --output-dir, по умолчанию текущая директория):
     <номерPR>_<sha>.json        — полный снимок PR
     answer_<номерPR>_<sha>.txt  — ответ LLM
+    review_<номерPR>_<sha>.json — отметка о размещённом review (с --post-review / --post-draft-review)
 
 Коды возврата: 0 — успех, 1 — были ошибки по отдельным PR, 2 — ошибка конфигурации.
 """
@@ -35,7 +36,7 @@ from urllib.parse import quote, urlparse
 
 import requests
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 DEFAULT_LLM_TIMEOUT = 900  # 15 минут
 DEFAULT_PAGE_SIZE = 50
@@ -44,6 +45,8 @@ DEFAULT_MAX_PROMPT_BYTES = 1024 * 1024
 MAX_UNIFIED_DIFF_BYTES = 8 * 1024 * 1024
 
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+REVIEW_EVENT_BY_MODE = {"draft": "PENDING", "review": "COMMENT"}
 
 # Сегменты веб-путей, по которым обрезаем «хвост» URL (…/owner/repo/src/branch/main)
 _TRAILING_MARKERS = {
@@ -82,6 +85,10 @@ class LLMError(Exception):
         super().__init__(message)
         self.retryable = retryable
         self.status = status
+
+
+class ReviewParseError(Exception):
+    """Ответ LLM не удалось разобрать как JSON-список замечаний."""
 
 
 def log(msg: str = "") -> None:
@@ -295,6 +302,50 @@ def _key_from_diff_git(line: str) -> str | None:
     return m.group("b")
 
 
+def _parse_line_number(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        number = int(value.strip())
+    else:
+        return None
+    return number if number >= 1 else None
+
+
+def parse_review_comments(answer: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Разбирает ответ LLM (JSON-список {file, line, comment_text}) в комментарии review Forgejo.
+
+    Возвращает (комментарии в формате API, причины пропуска некорректных записей).
+    """
+    try:
+        items = json.loads(answer)
+    except ValueError as exc:
+        raise ReviewParseError(f"невалидный JSON: {exc}") from exc
+    if not isinstance(items, list):
+        raise ReviewParseError(f"ожидался JSON-список, получено: {type(items).__name__}")
+
+    comments: list[dict[str, Any]] = []
+    problems: list[str] = []
+    for number, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            problems.append(f"запись №{number} не является объектом")
+            continue
+        path = item.get("file")
+        text = item.get("comment_text")
+        line = _parse_line_number(item.get("line"))
+        if not isinstance(path, str) or not path.strip():
+            problems.append(f"запись №{number}: не указан file")
+        elif line is None:
+            problems.append(f"запись №{number} ({path}): некорректный line {item.get('line')!r}")
+        elif not isinstance(text, str) or not text.strip():
+            problems.append(f"запись №{number} ({path}:{line}): пустой comment_text")
+        else:
+            comments.append({"path": path.strip(), "body": text.strip(), "new_position": line})
+    return comments, problems
+
+
 def _shorten(text: str | None, limit: int = 400) -> str:
     if not text:
         return "<пустой ответ>"
@@ -346,27 +397,31 @@ class ForgejoClient:
         params: dict[str, Any] | None = None,
         allow_404: bool = False,
         raw: bool = False,
+        json_body: Any = None,
     ) -> Any:
         url = f"{self.api_base}{path}"
+        # POST создаёт review: повтор после тайм-аута мог бы продублировать его
+        attempts = self.retries if method == "GET" else 1
         last_error: str = "неизвестная ошибка"
 
-        for attempt in range(self.retries):
+        for attempt in range(attempts):
             try:
-                resp = self.session.request(method, url, params=params, timeout=(15, self.timeout))
+                resp = self.session.request(method, url, params=params, json=json_body, timeout=(15, self.timeout))
             except requests.RequestException as exc:
                 last_error = f"сетевая ошибка: {exc}"
-                if attempt + 1 < self.retries:
+                if attempt + 1 < attempts:
                     self._backoff(attempt, f"{last_error}; повтор")
                     continue
                 raise ForgejoError(last_error, url=url) from exc
 
             if resp.status_code in RETRY_STATUS:
                 last_error = f"HTTP {resp.status_code}"
-                if attempt + 1 < self.retries:
+                if attempt + 1 < attempts:
                     self._backoff(attempt, f"HTTP {resp.status_code}; повтор", resp)
                     continue
+                tries = f" после {attempts} попыток" if attempts > 1 else ""
                 raise ForgejoError(
-                    f"Сервер вернул {resp.status_code} после {self.retries} попыток: {_shorten(resp.text)}",
+                    f"Сервер вернул {resp.status_code}{tries}: {_shorten(resp.text)}",
                     status=resp.status_code,
                     url=url,
                 )
@@ -470,6 +525,9 @@ class ForgejoClient:
 
     def list_review_comments(self, owner: str, repo: str, index: int, review_id: int) -> list[dict[str, Any]]:
         return list(self._paginate(f"/repos/{owner}/{repo}/pulls/{index}/reviews/{review_id}/comments"))
+
+    def create_pull_review(self, owner: str, repo: str, index: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", f"/repos/{owner}/{repo}/pulls/{index}/reviews", json_body=payload)
 
     def list_timeline(self, owner: str, repo: str, index: int) -> list[dict[str, Any]] | None:
         """Timeline есть не во всех версиях Forgejo — None означает «эндпоинт недоступен»."""
@@ -1337,6 +1395,8 @@ class Orchestrator:
             "json_reused": 0,
             "llm_called": 0,
             "llm_skipped": 0,
+            "reviews_posted": 0,
+            "reviews_skipped": 0,
             "failures": 0,
         }
 
@@ -1349,6 +1409,10 @@ class Orchestrator:
     @staticmethod
     def answer_name(index: int, sha: str) -> str:
         return f"answer_{index}_{safe_filename_part(sha) or 'nosha'}.txt"
+
+    @staticmethod
+    def review_name(index: int, sha: str) -> str:
+        return f"review_{index}_{safe_filename_part(sha)}.json"
 
     # -- фильтры ------------------------------------------------------------ #
 
@@ -1477,6 +1541,7 @@ class Orchestrator:
             comment_filter=self._comment_filter(),
         )
         self.stats["prs_total"] = len(selected)
+        review_mode = self._review_mode()
 
         for position, pull in enumerate(selected, start=1):
             index = pull.get("number")
@@ -1529,6 +1594,8 @@ class Orchestrator:
             if os.path.exists(answer_path) and not self.args.force_llm:
                 log(f"    · ответ LLM уже есть: {os.path.basename(answer_path)}")
                 self.stats["llm_skipped"] += 1
+                if review_mode:
+                    self._publish_review(client, review_mode, index, sha, answer_path, json_path, pr_payload)
                 continue
 
             try:
@@ -1558,8 +1625,131 @@ class Orchestrator:
             self.stats["llm_called"] += 1
             log(f"    · ответ сохранён: {os.path.basename(answer_path)}")
 
+            if review_mode:
+                self._publish_review(client, review_mode, index, sha, answer_path, json_path, pr_payload)
+
         self._print_summary()
         return 0 if self.stats["failures"] == 0 else 1
+
+    # -- публикация review -------------------------------------------------- #
+
+    def _review_mode(self) -> str | None:
+        if getattr(self.args, "post_review", False):
+            return "review"
+        if getattr(self.args, "post_draft_review", False):
+            return "draft"
+        return None
+
+    @staticmethod
+    def _snapshot_files(path: str, payload: dict[str, Any] | None) -> set[str]:
+        if payload is None:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        return {f["filename"] for f in payload.get("files") or [] if isinstance(f, dict) and f.get("filename")}
+
+    def _publish_review(
+        self,
+        client: ForgejoClient,
+        mode: str,
+        index: int,
+        sha: str,
+        answer_path: str,
+        json_path: str,
+        pr_payload: dict[str, Any] | None,
+    ) -> None:
+        marker_path = os.path.join(self.output_dir, self.review_name(index, sha))
+        if os.path.exists(marker_path) and not getattr(self.args, "force_review", False):
+            log(f"    · review уже размещён: {os.path.basename(marker_path)} (--force-review для повтора)")
+            self.stats["reviews_skipped"] += 1
+            return
+
+        try:
+            with open(answer_path, encoding="utf-8") as fh:
+                answer = fh.read()
+            pr_files = self._snapshot_files(json_path, pr_payload)
+        except (OSError, ValueError) as exc:
+            log(f"    ! не удалось прочитать данные для review: {exc}")
+            self.stats["failures"] += 1
+            return
+
+        try:
+            comments, problems = parse_review_comments(answer)
+        except ReviewParseError as exc:
+            log(f"    ! ответ LLM не разобран как JSON-список замечаний: {exc}")
+            self.stats["failures"] += 1
+            return
+
+        postable = []
+        for comment in comments:
+            if comment["path"] in pr_files:
+                postable.append(comment)
+            else:
+                problems.append(f"{comment['path']}:{comment['new_position']} — файла нет среди изменённых в PR")
+        for problem in problems:
+            log(f"    ! замечание пропущено: {problem}")
+
+        if not postable:
+            if problems:
+                log("    ! нет ни одного корректного замечания — review не создан")
+                self.stats["failures"] += 1
+            else:
+                log("    · LLM не нашла замечаний — review не создаётся")
+                self.stats["reviews_skipped"] += 1
+            return
+
+        try:
+            pending = next(
+                (r for r in client.list_pull_reviews(self.owner, self.repo, index) if r.get("state") == "PENDING"),
+                None,
+            )
+        except ForgejoError as exc:
+            log(f"    ! не удалось проверить существующие review: {exc}")
+            self.stats["failures"] += 1
+            return
+        if pending:
+            author = (pending.get("user") or {}).get("login") or "?"
+            log(
+                f"    ! в PR уже есть незавершённый review #{pending.get('id')} (автор: {author}): "
+                "Forgejo добавил бы замечания в него, а --post-review ещё и опубликовал бы его целиком. "
+                "Опубликуйте или удалите черновик и повторите запуск"
+            )
+            self.stats["failures"] += 1
+            return
+
+        payload = {
+            "event": REVIEW_EVENT_BY_MODE[mode],
+            "body": f"Автоматическая проверка (LLM: {self.args.model}). Замечаний: {len(postable)}.",
+            "commit_id": sha,
+            "comments": postable,
+        }
+        try:
+            review = client.create_pull_review(self.owner, self.repo, index, payload)
+        except ForgejoError as exc:
+            hint = ""
+            if exc.status == 403:
+                hint = " Для размещения review токену нужен scope 'write:repository'."
+            elif exc.status is None:
+                hint = " Результат неизвестен: проверьте PR в веб-интерфейсе перед повторным запуском."
+            log(f"    ! не удалось разместить review: {exc}{hint}")
+            self.stats["failures"] += 1
+            return
+
+        review_id = review.get("id") if isinstance(review, dict) else None
+        self.stats["reviews_posted"] += 1
+        what = "черновик review создан" if mode == "draft" else "review опубликован"
+        log(f"    · {what}: #{review_id}, замечаний: {len(postable)}")
+        marker = {
+            "mode": mode,
+            "review_id": review_id,
+            "comments": len(postable),
+            "model": self.args.model,
+            "posted_at": utc_now(),
+        }
+        try:
+            atomic_write_json(marker_path, marker)
+        except OSError as exc:
+            log(f"    ! не удалось записать {marker_path}: {exc}. Повторный запуск создаст дубликат review")
+            self.stats["failures"] += 1
 
     # -- вспомогательное ---------------------------------------------------- #
 
@@ -1599,6 +1789,9 @@ class Orchestrator:
         log(f"  JSON переиспользовано:{s['json_reused']:>3}")
         log(f"  запросов к LLM:       {s['llm_called']}")
         log(f"  ответов уже было:     {s['llm_skipped']}")
+        if self._review_mode():
+            log(f"  review размещено:     {s['reviews_posted']}")
+            log(f"  review пропущено:     {s['reviews_skipped']}")
         log(f"  ошибок:               {s['failures']}")
 
         if self.warnings:
@@ -1688,6 +1881,11 @@ def build_parser() -> argparse.ArgumentParser:
             "      --llm-url http://localhost:11434/v1/chat/completions \\\n"
             "      --model qwen2.5-coder:14b --prompt-file prompt.txt \\\n"
             "      --light-pr --comment-filter alice,bob,-bot\n\n"
+            "  # разместить замечания LLM в PR черновиком review (--post-review - сразу публичным)\n"
+            "  %(prog)s https://forgejo.example.com/owner/repo --token $TOK \\\n"
+            "      --llm-url http://localhost:11434/v1/chat/completions \\\n"
+            "      --model qwen2.5-coder:14b --prompt-file prompt.txt \\\n"
+            "      --post-draft-review\n\n"
             "Файлы: <N>_<sha>.json и answer_<N>_<sha>.txt\n"
             "Существующие файлы не перекачиваются (--refresh / --force-llm для повтора)."
         ),
@@ -1757,6 +1955,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--assignee", default=None, help="Выгружать только PR с этим assignee (логин)")
 
+    review_group = parser.add_mutually_exclusive_group()
+    review_group.add_argument(
+        "--post-draft-review",
+        action="store_true",
+        help=(
+            "После проверки LLM разместить замечания в PR черновиком review: он виден только владельцу токена, "
+            "пока тот не опубликует его в веб-интерфейсе. Ответ LLM должен быть JSON-списком "
+            "объектов {file, line, comment_text}"
+        ),
+    )
+    review_group.add_argument(
+        "--post-review",
+        action="store_true",
+        help="То же, но сразу публиковать полноценный review (событие COMMENT), видимый автору PR",
+    )
+    parser.add_argument(
+        "--force-review",
+        action="store_true",
+        help="Разместить review повторно, даже если для этого PR и коммита он уже размещался (review_<N>_<sha>.json)",
+    )
+
     group = parser.add_argument_group("вывод")
     group.add_argument("--output-dir", default=".", help="Каталог для результатов (по умолчанию текущий)")
     group.add_argument("--no-stream", action="store_true", help="Не печатать ответ LLM в консоль по мере генерации")
@@ -1815,6 +2034,10 @@ def validate_args(args: argparse.Namespace) -> None:
     parse_label_filters(args.label)  # ранняя проверка синтаксиса
     if getattr(args, "comment_filter", None) is not None:
         parse_label_filters(args.comment_filter)  # ранняя проверка синтаксиса
+    if getattr(args, "force_review", False) and not (
+        getattr(args, "post_review", False) or getattr(args, "post_draft_review", False)
+    ):
+        raise ConfigError("--force-review имеет смысл только вместе с --post-review или --post-draft-review.")
     if args.title_contains is not None and not args.title_contains.strip():
         raise ConfigError("Пустое значение --title-contains: укажите подстроку, например --title-contains=fix.")
 
