@@ -6,6 +6,7 @@ import os
 import sys
 
 import pytest
+import requests
 import responses
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1566,3 +1567,361 @@ def test_e2e_full_mode_still_logs_all_counts(tmp_path, prompt_file, capsys):
     )
     assert code == 0
     assert (out / f"3_{sha}.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+#  --post-draft-review / --post-review: размещение замечаний LLM в PR
+# --------------------------------------------------------------------------- #
+
+REVIEW_SHA = "cafe0123456789"
+REVIEW_FILE = "Pilipenko_Vladimir_lb3/src/main.c"
+REVIEWS_URL = f"{API}/repos/owner/repo/pulls/3/reviews"
+
+LLM_REVIEW_ANSWER = """[
+  {
+    "file": "Pilipenko_Vladimir_lb3/src/main.c",
+    "line": "18",
+    "comment_text": "Логика динамического расширения буфера повторяется здесь (чтение `text`) и позже в строках 75–85 (расширение `new`). Такой дублирующий код сложнее сопровождать: при изменении правил распределения легко ошибиться только в одном месте. Вынесите общий механизм выделения/перевыделения памяти в отдельную функцию."
+  },
+  {
+    "file": "Pilipenko_Vladimir_lb3/src/main.c",
+    "line": "56",
+    "comment_text": "Здесь и в строках 61–67 предложение, содержащее `555`, помечается флагом и полностью пропускается. В постановке лабораторной работы такого правила нет, из-за этого такие предложения исчезают из вывода и счётчик `m` может стать неверным. Уберите эту фильтрацию, если она явно не требуется."
+  }
+]"""
+
+
+def test_parse_review_comments_sample_answer():
+    comments, problems = app.parse_review_comments(LLM_REVIEW_ANSWER)
+    assert problems == []
+    assert [(c["path"], c["new_position"]) for c in comments] == [(REVIEW_FILE, 18), (REVIEW_FILE, 56)]
+    assert comments[0]["body"].startswith("Логика динамического расширения буфера")
+    assert comments[1]["body"].endswith("если она явно не требуется.")
+
+
+def test_parse_review_comments_skips_invalid_entries():
+    answer = json.dumps(
+        [
+            {"file": "a.c", "line": 7, "comment_text": "ok"},
+            {"line": "3", "comment_text": "no file"},
+            {"file": "a.c", "line": "abc", "comment_text": "bad line"},
+            {"file": "a.c", "line": 0, "comment_text": "zero line"},
+            {"file": "a.c", "line": True, "comment_text": "bool line"},
+            {"file": "a.c", "line": "4", "comment_text": "   "},
+            "not an object",
+        ]
+    )
+    comments, problems = app.parse_review_comments(answer)
+    assert comments == [{"path": "a.c", "body": "ok", "new_position": 7}]
+    assert len(problems) == 6
+
+
+@pytest.mark.parametrize("answer", ["Всё хорошо!", "", '{"file": "a.c"}', '"text"'])
+def test_parse_review_comments_rejects_non_list(answer):
+    with pytest.raises(app.ReviewParseError):
+        app.parse_review_comments(answer)
+
+
+def test_parse_review_comments_empty_list():
+    assert app.parse_review_comments("[]") == ([], [])
+
+
+def test_review_marker_naming():
+    assert app.Orchestrator.review_name(7, "abc123") == "review_7_abc123.json"
+
+
+@responses.activate
+def test_create_pull_review_sends_json_with_token():
+    responses.add(responses.POST, REVIEWS_URL, json={"id": 42, "state": "COMMENT"})
+    client = app.ForgejoClient(API, "tok")
+    payload = {"event": "COMMENT", "body": "b", "commit_id": "abc", "comments": []}
+    assert client.create_pull_review("owner", "repo", 3, payload)["id"] == 42
+    request = responses.calls[0].request
+    assert json.loads(request.body) == payload
+    assert request.headers["Authorization"] == "token tok"
+    assert request.headers["Content-Type"] == "application/json"
+
+
+@responses.activate
+def test_post_is_not_retried_on_server_error():
+    responses.add(responses.POST, REVIEWS_URL, status=500, body="boom")
+    client = app.ForgejoClient(API, "tok", retries=3)
+    with pytest.raises(app.ForgejoError) as exc_info:
+        client.create_pull_review("owner", "repo", 3, {"event": "COMMENT"})
+    assert exc_info.value.status == 500
+    assert len(responses.calls) == 1
+
+
+def _review_argv(prompt_file, out, *extra):
+    return [
+        REPO_URL,
+        "--token",
+        "tok",
+        "--llm-url",
+        LLM_URL,
+        "--model",
+        "m",
+        "--prompt-file",
+        prompt_file,
+        "--output-dir",
+        str(out),
+        *extra,
+    ]
+
+
+def _seed_review_run(out, answer=LLM_REVIEW_ANSWER, files=(REVIEW_FILE,)):
+    """Снимок PR и ответ LLM уже лежат на диске: LLM и сбор данных в тесте не участвуют."""
+    out.mkdir(exist_ok=True)
+    snapshot = {"pr_number": 3, "head_sha": REVIEW_SHA, "files": [{"filename": f} for f in files]}
+    (out / f"3_{REVIEW_SHA}.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    (out / f"answer_3_{REVIEW_SHA}.txt").write_text(answer, encoding="utf-8")
+
+
+def _mock_review_forgejo(existing_reviews=()):
+    pull = {
+        "number": 3,
+        "title": "lb3",
+        "labels": [],
+        "assignees": [],
+        "head": {"sha": REVIEW_SHA, "repo": {"full_name": "owner/repo"}},
+    }
+    responses.add(responses.GET, f"{API}/repos/owner/repo", json={"full_name": "owner/repo"})
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls", json=[pull])
+    responses.add(responses.GET, REVIEWS_URL, json=list(existing_reviews))
+
+
+def _review_posts():
+    return [c for c in responses.calls if c.request.method == "POST" and c.request.url == REVIEWS_URL]
+
+
+@responses.activate
+def test_post_review_publishes_comment_review(tmp_path, prompt_file, capsys):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    _mock_review_forgejo()
+    responses.add(responses.POST, REVIEWS_URL, json={"id": 42, "state": "COMMENT"})
+
+    code = app.main(_review_argv(prompt_file, out, "--post-review"))
+
+    assert code == 0
+    assert len(_review_posts()) == 1
+    body = json.loads(_review_posts()[0].request.body)
+    assert body["event"] == "COMMENT"
+    assert body["commit_id"] == REVIEW_SHA
+    assert body["body"].startswith("Автоматическая проверка (LLM: m)")
+    assert [(c["path"], c["new_position"]) for c in body["comments"]] == [(REVIEW_FILE, 18), (REVIEW_FILE, 56)]
+    assert body["comments"][0]["body"].startswith("Логика динамического расширения буфера")
+    assert not any(c.request.url.startswith(LLM_URL) for c in responses.calls)
+
+    marker = json.loads((out / f"review_3_{REVIEW_SHA}.json").read_text(encoding="utf-8"))
+    assert marker["mode"] == "review"
+    assert marker["review_id"] == 42
+    assert marker["comments"] == 2
+    assert "review размещено" in capsys.readouterr().err
+
+
+@responses.activate
+def test_post_draft_review_uses_pending_event(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    _mock_review_forgejo()
+    responses.add(responses.POST, REVIEWS_URL, json={"id": 43, "state": "PENDING"})
+
+    code = app.main(_review_argv(prompt_file, out, "--post-draft-review"))
+
+    assert code == 0
+    assert json.loads(_review_posts()[0].request.body)["event"] == "PENDING"
+    marker = json.loads((out / f"review_3_{REVIEW_SHA}.json").read_text(encoding="utf-8"))
+    assert marker["mode"] == "draft"
+    assert marker["review_id"] == 43
+
+
+@responses.activate
+def test_review_not_posted_without_flags(tmp_path, prompt_file, capsys):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    _mock_review_forgejo()
+
+    assert app.main(_review_argv(prompt_file, out)) == 0
+    assert _review_posts() == []
+    assert not (out / f"review_3_{REVIEW_SHA}.json").exists()
+    assert "review размещено" not in capsys.readouterr().err
+
+
+@responses.activate
+def test_review_posted_after_fresh_llm_answer(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    pull = {
+        "number": 3,
+        "title": "lb3",
+        "state": "open",
+        "labels": [],
+        "assignees": [],
+        "head": {"sha": REVIEW_SHA, "repo": {"full_name": "owner/repo"}},
+    }
+    responses.add(responses.GET, f"{API}/repos/owner/repo", json={"full_name": "owner/repo"})
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls", json=[pull])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/3/commits", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/3/files", json=[_file_entry(filename=REVIEW_FILE)])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/3/comments", json=[])
+    responses.add(responses.GET, REVIEWS_URL, json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/issues/3/timeline", json=[])
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls/3.diff", body="", content_type="text/plain")
+    responses.add(responses.POST, LLM_URL, body=_sse(LLM_REVIEW_ANSWER), content_type="text/event-stream")
+    responses.add(responses.POST, REVIEWS_URL, json={"id": 44, "state": "COMMENT"})
+
+    code = app.main(_review_argv(prompt_file, out, "--light-pr", "--post-review"))
+
+    assert code == 0
+    assert len(_review_posts()) == 1
+    assert len(json.loads(_review_posts()[0].request.body)["comments"]) == 2
+    assert (out / f"review_3_{REVIEW_SHA}.json").exists()
+
+
+@responses.activate
+def test_review_skipped_when_marker_exists(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    (out / f"review_3_{REVIEW_SHA}.json").write_text('{"mode": "draft", "review_id": 1}', encoding="utf-8")
+    _mock_review_forgejo()
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review")) == 0
+    assert _review_posts() == []
+
+
+@responses.activate
+def test_force_review_posts_again(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    (out / f"review_3_{REVIEW_SHA}.json").write_text('{"mode": "review", "review_id": 1}', encoding="utf-8")
+    _mock_review_forgejo()
+    responses.add(responses.POST, REVIEWS_URL, json={"id": 2, "state": "COMMENT"})
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review", "--force-review")) == 0
+    assert len(_review_posts()) == 1
+    assert json.loads((out / f"review_3_{REVIEW_SHA}.json").read_text(encoding="utf-8"))["review_id"] == 2
+
+
+@responses.activate
+def test_review_drops_comments_for_files_outside_pr(tmp_path, prompt_file, capsys):
+    out = tmp_path / "out"
+    answer = json.dumps(
+        [
+            {"file": REVIEW_FILE, "line": "18", "comment_text": "реальный файл"},
+            {"file": "ghost/file.c", "line": "5", "comment_text": "выдуманный файл"},
+        ],
+        ensure_ascii=False,
+    )
+    _seed_review_run(out, answer=answer)
+    _mock_review_forgejo()
+    responses.add(responses.POST, REVIEWS_URL, json={"id": 5, "state": "COMMENT"})
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review")) == 0
+    comments = json.loads(_review_posts()[0].request.body)["comments"]
+    assert [c["path"] for c in comments] == [REVIEW_FILE]
+    assert "ghost/file.c" in capsys.readouterr().err
+
+
+@responses.activate
+def test_review_all_comments_invalid_is_failure(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    answer = json.dumps([{"file": "ghost/file.c", "line": "5", "comment_text": "x"}])
+    _seed_review_run(out, answer=answer)
+    _mock_review_forgejo()
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review")) == 1
+    assert _review_posts() == []
+    assert not (out / f"review_3_{REVIEW_SHA}.json").exists()
+
+
+@responses.activate
+def test_review_empty_answer_creates_nothing(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    _seed_review_run(out, answer="[]")
+    _mock_review_forgejo()
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review")) == 0
+    assert _review_posts() == []
+    assert not (out / f"review_3_{REVIEW_SHA}.json").exists()
+
+
+@responses.activate
+def test_review_malformed_answer_is_failure(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    _seed_review_run(out, answer="Замечаний нет, всё отлично.")
+    _mock_review_forgejo()
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review")) == 1
+    assert _review_posts() == []
+
+
+@responses.activate
+@pytest.mark.parametrize("flag", ["--post-review", "--post-draft-review"])
+def test_review_blocked_by_existing_pending_review(tmp_path, prompt_file, capsys, flag):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    _mock_review_forgejo(existing_reviews=[{"id": 77, "state": "PENDING", "user": {"login": "teacher"}}])
+
+    assert app.main(_review_argv(prompt_file, out, flag)) == 1
+    assert _review_posts() == []
+    assert not (out / f"review_3_{REVIEW_SHA}.json").exists()
+    err = capsys.readouterr().err
+    assert "#77" in err
+    assert "teacher" in err
+
+
+@responses.activate
+def test_review_forbidden_mentions_write_scope(tmp_path, prompt_file, capsys):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    _mock_review_forgejo()
+    responses.add(responses.POST, REVIEWS_URL, status=403, json={"message": "token scope"})
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review")) == 1
+    assert len(_review_posts()) == 1
+    assert "write:repository" in capsys.readouterr().err
+    assert not (out / f"review_3_{REVIEW_SHA}.json").exists()
+
+
+@responses.activate
+def test_review_server_error_is_not_retried(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    _mock_review_forgejo()
+    responses.add(responses.POST, REVIEWS_URL, status=500, body="boom")
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review")) == 1
+    assert len(_review_posts()) == 1
+    assert not (out / f"review_3_{REVIEW_SHA}.json").exists()
+
+
+@responses.activate
+def test_review_network_error_warns_result_unknown(tmp_path, prompt_file, capsys):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    _mock_review_forgejo()
+    responses.add(responses.POST, REVIEWS_URL, body=requests.ConnectionError("timed out"))
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review")) == 1
+    assert len(_review_posts()) == 1
+    assert "Результат неизвестен" in capsys.readouterr().err
+
+
+@responses.activate
+def test_dry_run_never_posts_review(tmp_path, prompt_file):
+    out = tmp_path / "out"
+    _seed_review_run(out)
+    _mock_review_forgejo()
+
+    assert app.main(_review_argv(prompt_file, out, "--post-review", "--dry-run")) == 0
+    assert _review_posts() == []
+
+
+def test_post_flags_are_mutually_exclusive(prompt_file):
+    with pytest.raises(SystemExit) as exc_info:
+        app.build_parser().parse_args(_review_argv(prompt_file, ".", "--post-review", "--post-draft-review"))
+    assert exc_info.value.code == 2
+
+
+def test_force_review_requires_post_flag(prompt_file):
+    assert app.main(_review_argv(prompt_file, ".", "--force-review")) == 2
