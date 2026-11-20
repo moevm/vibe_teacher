@@ -1,0 +1,52 @@
+# AGENTS.md — forgejo-pr-llm
+
+Инструкции для всего репозитория. Это Python CLI, а не веб-сервис: он читает открытые PR из Forgejo, сохраняет JSON-снимки и отправляет их вместе с пользовательским промптом в OpenAI-совместимый `chat/completions`. По умолчанию ответ остаётся локальным. Примеры для пользователей и описание формата снимка — в `README.md`.
+
+## Где менять код
+
+Рабочий код и точка входа находятся в `forgejo_pr_llm.py`. Выбирайте участок по задаче:
+
+| Задача | Где начать | Что проверить |
+| --- | --- | --- |
+| Новый аргумент CLI | `build_parser`, `normalize_argv`, `validate_args` | Для флага со значением проверьте `_VALUE_FLAGS`; обновите `--help`, README и тесты разбора. |
+| Запрос к Forgejo | `ForgejoClient` | Сохраните обработку авторизации, пагинации и временных ошибок. Для теста подмените HTTP через `responses`. |
+| Состав снимка | `PRCollector`, `split_unified_diff` | Проверьте полный режим и `--light-pr`. Содержимое файла берётся из head-репозитория PR (это может быть форк); учитывайте удалённые, бинарные и слишком большие файлы. |
+| Запрос к модели | `LLMClient` | Проверяйте как поток SSE, так и обычный JSON-ответ. Токен LLM (`OPENAI_API_TOKEN`) не заменяет `FORGEJO_TOKEN`. |
+| Фильтры PR, повторный запуск, публикация | `Orchestrator`, `parse_review_comments` | Различайте локальную запись ответа и POST в Forgejo; проверяйте повторный запуск на том же head SHA. |
+
+## Контракты повторного запуска
+
+- Ключ файлов — номер PR и head SHA, а не модель, промпт или режим сбора. `<N>_<sha>.json` и `answer_<N>_<sha>.txt` переиспользуются независимо. `--refresh` обновляет снимок, `--force-llm` пересчитывает ответ. При смене режима снимка для чистого сравнения проще выбрать новый `--output-dir`.
+- Сохраняйте атомарную запись через `atomic_write_json` / `atomic_write_text`: незавершённый файл нельзя принять за готовый результат следующего запуска.
+- Только `--post-review` (`COMMENT`) и `--post-draft-review` (`PENDING`) включают запись в PR. Даже черновик меняет состояние Forgejo. `review_<N>_<sha>.json` служит маркером размещения; `--force-review` может создать дубликат. Для тестов публикации используйте моки, не рабочий PR.
+
+## Проверки из корня репозитория
+
+Для воспроизведения CI используйте Python 3.12. README указывает диапазон 3.10–3.13, но в `.github/workflows/ci.yml` матрица тестов сейчас содержит только 3.12. Ruff устанавливается в CI отдельно от dev-зависимостей.
+
+```sh
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt -r requirements-dev.txt 'ruff==0.17.5'
+ruff check .
+ruff format --check --diff .
+python -m pytest test_forgejo_pr_llm.py -v --tb=short
+```
+
+Для одной регрессии сначала запустите нужный тест, например `python -m pytest test_forgejo_pr_llm.py::test_collect_uses_head_fork_repo_for_content`. Тестам не нужны сервер и реальные ключи. Параметры линтера — в `ruff.toml` (120 символов, цель `py312`). При изменении контейнера проверьте `docker build -t forgejo-pr-llm:ci .` и `docker run --rm forgejo-pr-llm:ci --help`; CI также проверяет код 2 при ошибке конфигурации и запуск без root.
+
+## Ручная проверка без внешних сервисов
+
+Запустите `python fake_server.py` в отдельном терминале. Он имитирует чтение Forgejo и ответы LLM на `127.0.0.1:8765`, но не публикацию review. Из второго терминала с активным окружением:
+
+```sh
+work=$(mktemp -d)
+printf '%s\n' 'Кратко опиши изменения в PR.' > "$work/prompt.txt"
+FORGEJO_TOKEN=test OPENAI_API_TOKEN='' python forgejo_pr_llm.py \
+  http://127.0.0.1:8765/owner/repo \
+  --llm-url http://127.0.0.1:8765/v1/chat/completions --model fake-model \
+  --prompt-file "$work/prompt.txt" --output-dir "$work/out"
+ls "$work/out"
+```
+
+Проверьте пары JSON-снимков и текстовых ответов. Не добавляйте в Git токены, `.venv` и результаты запуска: `.gitignore` здесь исключает только `__pycache__/`. Реальные снимки могут содержать исходники и обсуждения PR — не отправляйте их на внешний LLM endpoint без согласования.
