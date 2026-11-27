@@ -258,6 +258,28 @@ def format_label_filters(required: list[str], forbidden: list[str]) -> str:
     return ", ".join(list(required) + [f"-{name}" for name in forbidden])
 
 
+def sort_pulls_by_number(pulls: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Упорядочивает PR по возрастанию номера.
+
+    Forgejo/Gitea отдаёт ``/repos/{owner}/{repo}/pulls`` в собственном порядке
+    (на практике — «сначала новые», то есть по убыванию номера), поэтому без
+    явной сортировки прогон шёл от старших PR к младшим и зависел от сервера.
+    Записи без числового ``number`` уходят в конец, сохраняя относительный
+    порядок ответа API (сортировка стабильная).
+    """
+
+    def key(pull: dict[str, Any]) -> tuple[int, int]:
+        number = pull.get("number")
+        if isinstance(number, bool):  # bool — подкласс int, но номером не является
+            return (1, 0)
+        try:
+            return (0, int(number))
+        except (TypeError, ValueError):
+            return (1, 0)
+
+    return sorted(pulls, key=key)
+
+
 def parse_login_list(expressions: Iterable[str] | str | None, *, flag: str) -> list[str]:
     """Разбирает список логинов: через запятую в одном значении и/или повторным флагом.
 
@@ -1592,6 +1614,9 @@ class Orchestrator:
         except ForgejoError as exc:
             log(f"ОШИБКА: не удалось получить список PR — {exc}")
             return 1
+
+        # Проверяем PR строго по возрастанию номера: на порядок ответа сервера не полагаемся.
+        pulls = sort_pulls_by_number(pulls)
 
         log(f"Открытых PR: {len(pulls)}")
         selected = [p for p in pulls if self._matches_filters(p)]

@@ -2200,3 +2200,71 @@ def test_post_flags_are_mutually_exclusive(prompt_file):
 
 def test_force_review_requires_post_flag(prompt_file):
     assert app.main(_review_argv(prompt_file, ".", "--force-review")) == 2
+
+
+# --------------------------------------------------------------------------- #
+#  порядок проверки PR — по возрастанию номера
+# --------------------------------------------------------------------------- #
+
+
+def test_sort_pulls_by_number_ascending():
+    pulls = [{"number": 13, "title": "c"}, {"number": 11, "title": "a"}, {"number": 12, "title": "b"}]
+    assert [p["number"] for p in app.sort_pulls_by_number(pulls)] == [11, 12, 13]
+
+
+def test_sort_pulls_by_number_accepts_string_numbers():
+    pulls = [{"number": "10"}, {"number": "2"}]
+    assert [p["number"] for p in app.sort_pulls_by_number(pulls)] == ["2", "10"]
+
+
+def test_sort_pulls_by_number_puts_records_without_number_last():
+    pulls = [{"number": "7"}, {"title": "no number"}, {"number": 3}, {"number": None}, {"number": True}]
+    ordered = app.sort_pulls_by_number(pulls)
+    assert ordered[0]["number"] == 3
+    assert ordered[1]["number"] == "7"
+    # записи без корректного номера сохраняют исходный порядок и уходят в конец
+    assert ordered[2] == {"title": "no number"}
+    assert ordered[3] == {"number": None}
+    assert ordered[4] == {"number": True}
+
+
+def test_sort_pulls_by_number_does_not_mutate_input():
+    pulls = [{"number": 2}, {"number": 1}]
+    app.sort_pulls_by_number(pulls)
+    assert [p["number"] for p in pulls] == [2, 1]
+
+
+@responses.activate
+def test_dry_run_lists_pulls_in_ascending_number_order(prompt_file, capsys):
+    """Сервер отдаёт PR по убыванию номера — обрабатывать их всё равно нужно по возрастанию."""
+
+    responses.add(responses.GET, f"{API}/repos/owner/repo", json={"full_name": "owner/repo"})
+    responses.add(
+        responses.GET,
+        f"{API}/repos/owner/repo/pulls",
+        json=[
+            {"number": 12, "title": "third", "head": {"sha": "cc3333"}},
+            {"number": 7, "title": "first", "head": {"sha": "aa1111"}},
+            {"number": 9, "title": "second", "head": {"sha": "bb2222"}},
+        ],
+    )
+
+    code = app.main(
+        [
+            REPO_URL,
+            "--token",
+            "tok",
+            "--llm-url",
+            LLM_URL,
+            "--model",
+            "m",
+            "--prompt-file",
+            prompt_file,
+            "--dry-run",
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 0
+    listed = [line for line in err.splitlines() if line.strip().startswith("#")]
+    assert [line.split("] ")[1] for line in listed] == ["first", "second", "third"]
