@@ -174,7 +174,30 @@ class Handler(BaseHTTPRequestHandler):
                             "line": 2,
                             "body": "nit: rename",
                             "diff_hunk": "@@ -1,3 +1,4 @@",
-                        }
+                        },
+                        # тред, помеченный решённым: Forgejo ставит resolver только на первый комментарий
+                        {
+                            "id": 910 + num,
+                            "user": {"login": "carol"},
+                            "resolver": {"login": "dave"},
+                            "pull_request_review_id": 500 + num,
+                            "path": "src/login.py",
+                            "position": 3,
+                            "original_position": 0,
+                            "body": "typo in the message",
+                            "diff_hunk": "@@ -1,3 +1,4 @@",
+                        },
+                        {
+                            "id": 920 + num,
+                            "user": {"login": "alice"},
+                            "resolver": None,
+                            "pull_request_review_id": 500 + num,
+                            "path": "src/login.py",
+                            "position": 3,
+                            "original_position": 0,
+                            "body": "fixed",
+                            "diff_hunk": "@@ -1,3 +1,4 @@",
+                        },
                     ],
                     qs,
                 )
