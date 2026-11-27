@@ -109,7 +109,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/repos/owner/repo":
             return self._json({"full_name": "owner/repo", "empty": False, "default_branch": "main"})
         if path == "/api/v1/repos/owner/repo/pulls":
-            return self._page(list(PULLS.values()), qs)
+            # Как настоящий Forgejo: «сначала новые», то есть по убыванию номера.
+            return self._page(sorted(PULLS.values(), key=lambda pr: pr["number"], reverse=True), qs)
 
         for num in PULLS:
             p = f"/api/v1/repos/owner/repo/pulls/{num}"
