@@ -36,7 +36,7 @@ from urllib.parse import quote, urlparse
 
 import requests
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 DEFAULT_LLM_TIMEOUT = 900  # 15 минут
 DEFAULT_PAGE_SIZE = 50
@@ -116,6 +116,7 @@ _COUNT_LABELS = {
     "review_comments": "inline-комментариев",
     "timeline_events": "событий",
     "open_review_comments": "незакрытых комментариев",
+    "resolved_review_comments_skipped": "пропущено решённых комментариев",
 }
 
 
@@ -255,6 +256,34 @@ def parse_label_filters(expressions: Iterable[str] | str | None) -> tuple[list[s
 
 def format_label_filters(required: list[str], forbidden: list[str]) -> str:
     return ", ".join(list(required) + [f"-{name}" for name in forbidden])
+
+
+def parse_login_list(expressions: Iterable[str] | str | None, *, flag: str) -> list[str]:
+    """Разбирает список логинов: через запятую в одном значении и/или повторным флагом.
+
+    В отличие от ``parse_label_filters`` исключений здесь нет: префикс ``-`` —
+    ошибка, иначе ``-bot`` молча превратился бы в логин, которого не бывает.
+    """
+    if expressions is None:
+        return []
+    raw_values = [expressions] if isinstance(expressions, str) else [e for e in expressions if e is not None]
+
+    logins: list[str] = []
+    for value in raw_values:
+        tokens = [token.strip() for token in value.split(",")]
+        tokens = [token for token in tokens if token]  # пустые сегменты между запятыми допустимы
+        if not tokens:
+            raise ConfigError(f"Пустое значение {flag}: укажите логины, например {flag}=alice,bob.")
+        for token in tokens:
+            if token.startswith("-"):
+                raise ConfigError(f"{flag} принимает только логины, исключение через '-' не поддерживается: {token!r}.")
+            logins.append(token)
+    return list(dict.fromkeys(logins))
+
+
+def _login_of(user: Any) -> str:
+    """Логин из объекта пользователя Forgejo в нижнем регистре; пустая строка, если пользователя нет."""
+    return (user.get("login") or "").lower() if isinstance(user, dict) else ""
 
 
 def split_unified_diff(diff_text: str) -> dict[str, str]:
@@ -666,12 +695,14 @@ class PRCollector:
         max_diff_bytes: int = MAX_UNIFIED_DIFF_BYTES,
         light_pr: bool = False,
         comment_filter: tuple[list[str], list[str]] | None = None,
+        skip_resolved_by: Iterable[str] | None = None,
     ) -> None:
         self.client = client
         self.max_file_bytes = max_file_bytes
         self.max_diff_bytes = max_diff_bytes
         self.light_pr = light_pr
         self.comment_filter = comment_filter
+        self.skip_resolved_by = {login.lower() for login in skip_resolved_by or []}
 
     def collect(
         self,
@@ -711,6 +742,26 @@ class PRCollector:
 
         review_comments = self._collect_review_comments(owner, repo, index, reviews, errors, warnings)
 
+        # Пропуск тредов, решённых указанными пользователями (--comments-skip-resolved-by).
+        # Делается до --comment-filter: отметка о решении стоит на первом комментарии
+        # треда, и фильтр по авторам не должен её потерять.
+        skipped_resolved = 0
+        if self.skip_resolved_by:
+            review_comments, skipped = self._skip_resolved_threads(review_comments, self.skip_resolved_by)
+            skipped_resolved = len(skipped)
+            if timeline:
+                # Forgejo дублирует inline-комментарии в timeline событиями type=code
+                # (в релизных ветках до v15.0 — да, в ветке разработки их оттуда убрали)
+                skipped_ids = {c.get("id") for c in skipped} - {None}
+                timeline = [
+                    e for e in timeline if not self._is_skipped_code_event(e, skipped_ids, self.skip_resolved_by)
+                ]
+
+        def finish(snapshot: dict[str, Any]) -> dict[str, Any]:
+            if self.skip_resolved_by:
+                snapshot["counts"]["resolved_review_comments_skipped"] = skipped_resolved
+            return snapshot
+
         # Фильтрация комментариев по авторам (--comment-filter)
         if self.comment_filter is not None:
             issue_comments = self._filter_comments(issue_comments, self.comment_filter)
@@ -722,18 +773,20 @@ class PRCollector:
 
         # Облегчённый режим: только файлы и незакрытые review-комментарии
         if self.light_pr:
-            return self._collect_light(
-                pull,
-                index,
-                owner,
-                repo,
-                base_url,
-                head_sha,
-                head_full_name,
-                files,
-                review_comments,
-                errors,
-                warnings,
+            return finish(
+                self._collect_light(
+                    pull,
+                    index,
+                    owner,
+                    repo,
+                    base_url,
+                    head_sha,
+                    head_full_name,
+                    files,
+                    review_comments,
+                    errors,
+                    warnings,
+                )
             )
 
         # Патчи, обрезанные сервером, добираем из общего .diff
@@ -755,7 +808,7 @@ class PRCollector:
             timeline = self._synthetic_timeline(issue_comments, reviews, review_comments)
             warnings.append(f"PR #{index}: эндпоинт timeline недоступен, собрана синтетическая история")
 
-        return {
+        snapshot = {
             "schema_version": "1.0",
             "fetched_at": utc_now(),
             "generator": f"forgejo-pr-llm/{__version__}",
@@ -788,6 +841,7 @@ class PRCollector:
             "timeline": timeline,
             "fetch_errors": errors,
         }
+        return finish(snapshot)
 
     # -- детали ------------------------------------------------------------- #
 
@@ -844,6 +898,41 @@ class PRCollector:
                 continue
             result.append(c)
         return result
+
+    @staticmethod
+    def _skip_resolved_threads(
+        comments: list[dict[str, Any]],
+        logins: set[str],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Делит inline-комментарии на (оставленные, пропущенные).
+
+        Пропускается тред целиком, если его пометил решённым кто-то из ``logins``
+        (в нижнем регистре). Forgejo ставит ``resolver`` только на первый комментарий
+        треда, поэтому ответы находим по ключу треда — как их группирует сам Forgejo:
+        одно ревью, один файл, одна строка (``position`` — новая версия файла,
+        ``original_position`` — старая). Комментарий без координат считается
+        отдельным тредом.
+        """
+
+        def thread_key(number: int, comment: dict[str, Any]) -> tuple[Any, ...]:
+            position = comment.get("position")
+            original = comment.get("original_position")
+            if position is None and original is None:
+                return ("single", number)
+            return (comment.get("_review_id"), comment.get("path"), position or 0, original or 0)
+
+        keys = [thread_key(number, comment) for number, comment in enumerate(comments)]
+        resolved = {key for key, comment in zip(keys, comments) if _login_of(comment.get("resolver")) in logins}
+        kept = [comment for key, comment in zip(keys, comments) if key not in resolved]
+        skipped = [comment for key, comment in zip(keys, comments) if key in resolved]
+        return kept, skipped
+
+    @staticmethod
+    def _is_skipped_code_event(event: Any, skipped_ids: set[Any], logins: set[str]) -> bool:
+        """Событие timeline, дублирующее пропущенный inline-комментарий."""
+        if not isinstance(event, dict) or event.get("type") != "code":
+            return False
+        return event.get("id") in skipped_ids or _login_of(event.get("resolve_doer")) in logins
 
     def _collect_light(
         self,
@@ -1436,6 +1525,13 @@ class Orchestrator:
             self._comment_filter_cache = cached
         return cached
 
+    def _skip_resolved_by(self) -> list[str]:
+        """Логины из --comments-skip-resolved-by; пустой список, если флаг не задан."""
+        return parse_login_list(
+            getattr(self.args, "comments_skip_resolved_by", None),
+            flag="--comments-skip-resolved-by",
+        )
+
     def _matches_filters(self, pull: dict[str, Any]) -> bool:
         required, forbidden = self._label_filters()
         if required or forbidden:
@@ -1534,11 +1630,15 @@ class Orchestrator:
             api_token=getattr(self.args, "openai_api_token", None),
         )
 
+        skip_resolved_by = self._skip_resolved_by()
+        if skip_resolved_by:
+            log(f"Пропускаю inline-комментарии из тредов, которые пометили решёнными: {', '.join(skip_resolved_by)}")
         collector = PRCollector(
             client,
             max_file_bytes=self.args.max_file_bytes,
             light_pr=getattr(self.args, "light_pr", False),
             comment_filter=self._comment_filter(),
+            skip_resolved_by=skip_resolved_by,
         )
         self.stats["prs_total"] = len(selected)
         review_mode = self._review_mode()
@@ -1819,6 +1919,7 @@ _VALUE_FLAGS = {
     "--output-dir",
     "--openai-api-token",
     "--comment-filter",
+    "--comments-skip-resolved-by",
     "--title-contains",
 }
 
@@ -1945,6 +2046,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--comments-skip-resolved-by",
+        default=None,
+        action="append",
+        metavar="ПОЛЬЗОВАТЕЛИ",
+        help=(
+            "Не выгружать inline-комментарии из тредов, которые пометил решёнными "
+            "кто-то из указанных пользователей. Логины — через запятую или повторным "
+            "флагом, регистр не важен. Применяется в любом режиме сохранения PR"
+        ),
+    )
+    parser.add_argument(
         "--title-contains",
         default=None,
         metavar="ПОДСТРОКА",
@@ -2034,6 +2146,10 @@ def validate_args(args: argparse.Namespace) -> None:
     parse_label_filters(args.label)  # ранняя проверка синтаксиса
     if getattr(args, "comment_filter", None) is not None:
         parse_label_filters(args.comment_filter)  # ранняя проверка синтаксиса
+    parse_login_list(  # ранняя проверка синтаксиса
+        getattr(args, "comments_skip_resolved_by", None),
+        flag="--comments-skip-resolved-by",
+    )
     if getattr(args, "force_review", False) and not (
         getattr(args, "post_review", False) or getattr(args, "post_draft_review", False)
     ):

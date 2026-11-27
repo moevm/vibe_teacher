@@ -1426,6 +1426,281 @@ def test_comment_filter_empty_is_none():
 
 
 # --------------------------------------------------------------------------- #
+#  --comments-skip-resolved-by: пропуск тредов, решённых указанными пользователями
+# --------------------------------------------------------------------------- #
+
+SKIP_FLAG = "--comments-skip-resolved-by"
+
+
+def _rc(cid, body, *, review=50, path="a.py", position=3, original_position=0, user="carol", resolver=None):
+    """Inline-комментарий в формате Forgejo: resolver стоит только на первом комментарии треда."""
+    return {
+        "id": cid,
+        "body": body,
+        "user": {"login": user},
+        "resolver": {"login": resolver} if resolver else None,
+        "pull_request_review_id": review,
+        "_review_id": review,
+        "path": path,
+        "position": position,
+        "original_position": original_position,
+        "created_at": f"2026-01-01T00:00:{cid:02d}Z",
+    }
+
+
+def _resolved_threads():
+    """Три треда одного ревью: решён alice (с ответом), решён dave, открытый."""
+    return [
+        _rc(10, "root, resolved by alice", user="bot", resolver="alice"),
+        _rc(11, "reply in the thread resolved by alice"),
+        _rc(12, "resolved by dave", position=7, resolver="dave"),
+        _rc(13, "open", position=9),
+    ]
+
+
+def _mock_pr7(review_comments, timeline=()):
+    """PR #7 с одним ревью (id 50); timeline=None — endpoint недоступен (404)."""
+    base = f"{API}/repos/owner/repo"
+    responses.add(responses.GET, f"{base}/pulls/7/commits", json=[])
+    responses.add(responses.GET, f"{base}/pulls/7/files", json=[])
+    responses.add(responses.GET, f"{base}/issues/7/comments", json=[])
+    responses.add(responses.GET, f"{base}/pulls/7.diff", body="", content_type="text/plain")
+    responses.add(
+        responses.GET, f"{base}/pulls/7/reviews", json=[{"id": 50, "state": "COMMENTED", "user": {"login": "x"}}]
+    )
+    responses.add(responses.GET, f"{base}/pulls/7/reviews/50/comments", json=review_comments)
+    if timeline is None:
+        responses.add(responses.GET, f"{base}/issues/7/timeline", status=404)
+    else:
+        responses.add(responses.GET, f"{base}/issues/7/timeline", json=list(timeline))
+
+
+def _collect_pr7(**collector_kwargs):
+    client = app.ForgejoClient(API, "tok", verbose=False)
+    collector = app.PRCollector(client, max_file_bytes=1024, **collector_kwargs)
+    return collector.collect("owner", "repo", _pull(), base_url="x", warnings=[])
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, []),
+        ("alice", ["alice"]),
+        (["alice,bob"], ["alice", "bob"]),
+        (["alice", " bob , carol "], ["alice", "bob", "carol"]),
+        (["alice,,alice"], ["alice"]),
+    ],
+)
+def test_parse_login_list(value, expected):
+    assert app.parse_login_list(value, flag=SKIP_FLAG) == expected
+
+
+@pytest.mark.parametrize("bad", [[""], [" , "], ["-bot"], ["alice,-bot"], ["alice", ""]])
+def test_parse_login_list_errors(bad):
+    with pytest.raises(app.ConfigError, match=SKIP_FLAG):
+        app.parse_login_list(bad, flag=SKIP_FLAG)
+
+
+def test_skip_resolved_flag_default_is_none():
+    argv = [REPO_URL, "--token", "t", "--llm-url", "u", "--model", "m", "--prompt-file", "x"]
+    assert app.build_parser().parse_args(argv).comments_skip_resolved_by is None
+
+
+def test_skip_resolved_flag_parse():
+    argv = app.normalize_argv(
+        [
+            REPO_URL,
+            "--token",
+            "t",
+            "--llm-url",
+            "u",
+            "--model",
+            "m",
+            "--prompt-file",
+            "x",
+            SKIP_FLAG,
+            "alice,bob",
+            f"{SKIP_FLAG}=carol",
+        ]
+    )
+    args = app.build_parser().parse_args(argv)
+    assert args.comments_skip_resolved_by == ["alice,bob", "carol"]
+    assert app.parse_login_list(args.comments_skip_resolved_by, flag=SKIP_FLAG) == ["alice", "bob", "carol"]
+
+
+@pytest.mark.parametrize("value", ["", "-bot"])
+def test_validate_args_rejects_bad_skip_resolved_by(tmp_path, prompt_file, value):
+    args = _ns(tmp_path, prompt_file, comments_skip_resolved_by=[value])
+    with pytest.raises(app.ConfigError, match=SKIP_FLAG):
+        app.validate_args(args)
+
+
+def test_skip_resolved_dash_value_is_config_error_not_argparse_error(prompt_file, capsys):
+    """`--comments-skip-resolved-by -bot` доходит до проверки значения и даёт код 2 с понятным текстом."""
+    code = app.main(
+        [
+            REPO_URL,
+            "--token",
+            "t",
+            "--llm-url",
+            LLM_URL,
+            "--model",
+            "m",
+            "--prompt-file",
+            prompt_file,
+            SKIP_FLAG,
+            "-bot",
+        ]
+    )
+    assert code == 2
+    assert SKIP_FLAG in capsys.readouterr().err
+
+
+def test_skip_resolved_threads_drops_whole_thread():
+    comments = [
+        *_resolved_threads(),
+        _rc(14, "same line, another review", review=51),
+        _rc(15, "same number, old side of the diff", position=0, original_position=3),
+        _rc(16, "same line, another file", path="b.py"),
+    ]
+    # логин во флаге сравнивается без учёта регистра: PRCollector приводит его к нижнему
+    kept, skipped = app.PRCollector._skip_resolved_threads(comments, {"alice"})
+    assert [c["id"] for c in skipped] == [10, 11]
+    assert [c["id"] for c in kept] == [12, 13, 14, 15, 16]
+
+
+def test_skip_resolved_threads_resolver_login_case_insensitive():
+    kept, skipped = app.PRCollector._skip_resolved_threads([_rc(1, "x", resolver="Alice")], {"alice"})
+    assert kept == []
+    assert len(skipped) == 1
+
+
+def test_skip_resolved_threads_without_coordinates_are_not_merged():
+    """Если сервер не отдал position/original_position, соседние комментарии не считаются одним тредом."""
+    comments = [
+        {"id": 1, "_review_id": 50, "path": "a.py", "body": "resolved", "resolver": {"login": "alice"}},
+        {"id": 2, "_review_id": 50, "path": "a.py", "body": "unrelated"},
+    ]
+    kept, skipped = app.PRCollector._skip_resolved_threads(comments, {"alice"})
+    assert [c["id"] for c in skipped] == [1]
+    assert [c["id"] for c in kept] == [2]
+
+
+@responses.activate
+def test_skip_resolved_by_in_full_mode():
+    _mock_pr7(
+        _resolved_threads(),
+        timeline=[
+            # релизные версии Forgejo отдают inline-комментарии и в timeline (type=code)
+            {"id": 10, "type": "code", "body": "root, resolved by alice", "resolve_doer": {"login": "alice"}},
+            {"id": 11, "type": "code", "body": "reply in the thread resolved by alice", "resolve_doer": None},
+            {"id": 12, "type": "code", "body": "resolved by dave", "resolve_doer": {"login": "dave"}},
+            {"id": 77, "type": "comment", "body": "plain comment", "resolve_doer": None},
+            {"id": 78, "type": "label", "body": "", "resolve_doer": None},
+        ],
+    )
+    snap = _collect_pr7(skip_resolved_by=["Alice"])
+
+    assert [c["id"] for c in snap["review_comments"]] == [12, 13]
+    assert [e["id"] for e in snap["timeline"]] == [12, 77, 78]
+    assert snap["counts"]["review_comments"] == 2
+    assert snap["counts"]["timeline_events"] == 3
+    assert snap["counts"]["resolved_review_comments_skipped"] == 2
+    assert "resolved by alice" not in json.dumps(snap)
+
+
+@responses.activate
+def test_skip_resolved_by_several_users():
+    _mock_pr7(_resolved_threads())
+    snap = _collect_pr7(skip_resolved_by=["alice", "dave"])
+    assert [c["id"] for c in snap["review_comments"]] == [13]
+    assert snap["counts"]["resolved_review_comments_skipped"] == 3
+
+
+@responses.activate
+def test_resolved_comments_kept_without_flag():
+    """Без флага снимок не меняется: решённые треды на месте, счётчика пропущенных нет."""
+    _mock_pr7(_resolved_threads())
+    snap = _collect_pr7()
+    assert [c["id"] for c in snap["review_comments"]] == [10, 11, 12, 13]
+    assert "resolved_review_comments_skipped" not in snap["counts"]
+
+
+@responses.activate
+def test_skip_resolved_by_no_match_reports_zero():
+    _mock_pr7(_resolved_threads())
+    snap = _collect_pr7(skip_resolved_by=["nobody"])
+    assert [c["id"] for c in snap["review_comments"]] == [10, 11, 12, 13]
+    assert snap["counts"]["resolved_review_comments_skipped"] == 0
+
+
+@responses.activate
+def test_skip_resolved_by_applied_before_comment_filter():
+    """Автор первого комментария отсечён --comment-filter, но ответы решённого треда всё равно пропускаются."""
+    _mock_pr7(_resolved_threads())
+    snap = _collect_pr7(skip_resolved_by=["alice"], comment_filter=([], ["bot"]))
+    assert [c["id"] for c in snap["review_comments"]] == [12, 13]
+
+
+@responses.activate
+def test_skip_resolved_by_with_synthetic_timeline():
+    _mock_pr7(_resolved_threads(), timeline=None)
+    snap = _collect_pr7(skip_resolved_by=["alice"])
+    assert snap["source"]["history_unavailable"] is True
+    assert [e["id"] for e in snap["timeline"] if e["type"] == "review_comment"] == [12, 13]
+
+
+@responses.activate
+def test_skip_resolved_by_in_light_mode():
+    _mock_pr7(_resolved_threads())
+    snap = _collect_pr7(light_pr=True, skip_resolved_by=["alice"])
+    assert snap["mode"] == "light"
+    assert [c["id"] for c in snap["review_comments"]] == [12, 13]
+    assert snap["counts"] == {"files": 0, "open_review_comments": 2, "resolved_review_comments_skipped": 2}
+
+
+@responses.activate
+def test_e2e_skip_resolved_by_reaches_snapshot_and_llm(tmp_path, prompt_file, capsys):
+    """Сквозной прогон через main(): флаг доходит до JSON на диске и до запроса к LLM."""
+    out = tmp_path / "out"
+    responses.add(responses.GET, f"{API}/repos/owner/repo", json={"full_name": "owner/repo", "empty": False})
+    responses.add(responses.GET, f"{API}/repos/owner/repo/pulls", json=[_pull()])
+    _mock_pr7(_resolved_threads())
+    responses.add(responses.POST, LLM_URL, json={"choices": [{"message": {"content": "ok"}}]})
+
+    code = app.main(
+        [
+            REPO_URL,
+            "--token",
+            "tok",
+            "--llm-url",
+            LLM_URL,
+            "--model",
+            "m",
+            "--prompt-file",
+            prompt_file,
+            "--output-dir",
+            str(out),
+            "--no-stream",
+            SKIP_FLAG,
+            "Alice",
+        ]
+    )
+
+    assert code == 0
+    snap = json.loads((out / "7_abc123def456.json").read_text(encoding="utf-8"))
+    assert [c["id"] for c in snap["review_comments"]] == [12, 13]
+    assert snap["counts"]["resolved_review_comments_skipped"] == 2
+
+    llm_request = next(c.request for c in responses.calls if c.request.url == LLM_URL)
+    assert "resolved by alice" not in json.loads(llm_request.body)["messages"][1]["content"]
+
+    logged = capsys.readouterr().err
+    assert "пометили решёнными: Alice" in logged
+    assert "пропущено решённых комментариев 2" in logged
+
+
+# --------------------------------------------------------------------------- #
 #  Регрессия: логирование counts в light-режиме (KeyError 'commits')
 # --------------------------------------------------------------------------- #
 
